@@ -480,6 +480,42 @@ def _append_parsed_record(
         records.append(new_rec)
 
 
+def _parse_aggregate_identifiers(record: dict[str, Any]) -> dict[str, Any]:
+    """Validate canonical identifiers and the legacy identities spelling.
+
+    RFC 7489 Appendix C and RFC 9990 section 3.1.1.10 require one
+    header_from. A legacy alias may not replace conflicting canonical data.
+    """
+    values = {}
+    for element in ("identifiers", "identities"):
+        if element not in record:
+            continue
+        identifiers = record[element]
+        if not isinstance(identifiers, dict):
+            raise ValueError(f"{element} must contain a single identifier set")
+        header_from = identifiers.get("header_from")
+        if not isinstance(header_from, str) or not header_from.strip():
+            raise ValueError(f"{element} must contain one nonempty header_from")
+        for field in ("envelope_from", "envelope_to"):
+            value = identifiers.get(field)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"{element}/{field} must contain a single text value")
+        values[element] = identifiers.copy()
+        values[element]["header_from"] = header_from.strip().lower()
+    if not values:
+        raise ValueError("Missing identifiers")
+    if "identifiers" in values and "identities" in values:
+        canonical = values["identifiers"]
+        legacy = values["identities"]
+        for field in ("header_from", "envelope_from", "envelope_to"):
+            if field in canonical and field in legacy:
+                if (canonical[field] or "").lower() != (legacy[field] or "").lower():
+                    raise ValueError(f"Conflicting identifiers and identities: {field}")
+    if "identities" in values:
+        logger.warning("Nonstandard identities element used in aggregate record")
+    return values["identifiers"] if "identifiers" in values else values["identities"]
+
+
 def _parse_report_record(
     record: dict[str, Any],
     *,
@@ -500,6 +536,7 @@ def _parse_report_record(
         dict: The converted record
     """
     record = record.copy()
+    identifiers = _parse_aggregate_identifiers(record)
     new_record: dict[str, Any] = {}
     if record["row"]["source_ip"] is None:
         raise ValueError("Source IP address is empty")
@@ -577,16 +614,8 @@ def _parse_report_record(
             )
     new_policy_evaluated["policy_override_reasons"] = reasons
     new_record["policy_evaluated"] = new_policy_evaluated
-    if "identities" in record:
-        new_record["identifiers"] = record["identities"].copy()
-    else:
-        new_record["identifiers"] = record["identifiers"].copy()
+    new_record["identifiers"] = identifiers
     new_record["auth_results"] = {"dkim": [], "spf": []}
-    if type(new_record["identifiers"]["header_from"]) is str:
-        lowered_from = new_record["identifiers"]["header_from"].lower()
-    else:
-        lowered_from = ""
-    new_record["identifiers"]["header_from"] = lowered_from
     if isinstance(record["auth_results"], dict):
         auth_results = record["auth_results"].copy()
         if "spf" not in auth_results:

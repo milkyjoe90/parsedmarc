@@ -267,7 +267,9 @@ class Test(unittest.TestCase):
         self.assertEqual(report["report_metadata"]["org_name"], "google.com")
 
     def testAggregateSamples(self):
-        """Test sample aggregate/rua DMARC reports"""
+        """Parse samples, rejecting an unrecoverable header_from per RFC 9990
+        section 3.1.1.10 (https://www.rfc-editor.org/rfc/rfc9990.html#section-3.1.1.10).
+        """
         print()
         sample_paths = glob("samples/aggregate/*")
         for sample_path in sample_paths:
@@ -275,6 +277,10 @@ class Test(unittest.TestCase):
                 continue
             print(f"Testing {sample_path}: ", end="")
             with self.subTest(sample=sample_path):
+                if sample_path == "samples/aggregate/invalid_xml.xml":
+                    with self.assertRaisesRegex(parsedmarc.ParserError, "header_from"):
+                        parsedmarc.parse_report_file(sample_path, offline=True)
+                    continue
                 result = parsedmarc.parse_report_file(
                     sample_path, always_use_local_files=True, offline=OFFLINE_MODE
                 )
@@ -2156,6 +2162,102 @@ class Test(unittest.TestCase):
         row = next(reader)
         self.assertEqual(row["subject"], "report")
         self.assertEqual(row["user_agent"], "AgentX")
+
+
+class TestAggregateIdentifiers(unittest.TestCase):
+    """RFC 7489 Appendix C and RFC 9990 section 3.1.1.10 identify records.
+
+    https://www.rfc-editor.org/rfc/rfc7489.html#appendix-C
+    https://www.rfc-editor.org/rfc/rfc9990.html#section-3.1.1.10
+    """
+
+    @staticmethod
+    def _parse(identifiers):
+        return parsedmarc.parse_aggregate_report_xml(
+            f"""<feedback>
+            <report_metadata><org_name>Reporter</org_name><email>reports@example.com</email>
+            <report_id>identifier-test</report_id><date_range><begin>1788998400</begin>
+            <end>1789084800</end></date_range></report_metadata>
+            <policy_published><domain>example.com</domain><p>none</p></policy_published>
+            <record><row><source_ip>192.0.2.1</source_ip><count>10</count>
+            <policy_evaluated><disposition>none</disposition><dkim>pass</dkim><spf>fail</spf>
+            </policy_evaluated></row>{identifiers}<auth_results/></record></feedback>""",
+            offline=True,
+        )
+
+    def test_canonical_and_unambiguous_legacy_identifiers(self):
+        """RFC 9990 section 3.1.1.10: retain canonical identity and alignment."""
+        canonical = (
+            "<identifiers><header_from>Example.COM</header_from>"
+            "<envelope_to>recipient.example</envelope_to></identifiers>"
+        )
+        for identifiers in (
+            canonical,
+            canonical.replace("identifiers", "identities"),
+            canonical
+            + "<identities><header_from>example.com</header_from></identities>",
+            canonical + canonical.replace("identifiers", "identities"),
+        ):
+            with self.subTest(identifiers=identifiers):
+                if "identities" in identifiers:
+                    with self.assertLogs("parsedmarc.log", level="WARNING") as logs:
+                        report = self._parse(identifiers)
+                    self.assertTrue(
+                        any("Nonstandard identities" in line for line in logs.output)
+                    )
+                else:
+                    report = self._parse(identifiers)
+                self.assertEqual(len(report["records"]), 1)
+                record = report["records"][0]
+                self.assertEqual(record["identifiers"]["header_from"], "example.com")
+                self.assertEqual(
+                    record["identifiers"]["envelope_to"], "recipient.example"
+                )
+                self.assertEqual(record["count"], 10)
+                self.assertEqual(
+                    record["alignment"], {"dkim": True, "spf": False, "dmarc": True}
+                )
+
+    def test_conflicting_legacy_identifiers_are_rejected(self):
+        """RFC 9990 section 3.1.1.7: identifiers belong to the evaluated row."""
+        for field in ("header_from", "envelope_from", "envelope_to"):
+            with self.subTest(field=field):
+                canonical = "<header_from>example.com</header_from>"
+                if field != "header_from":
+                    canonical += f"<{field}>example.com</{field}>"
+                legacy = canonical.replace(
+                    f"<{field}>example.com", f"<{field}>different.example"
+                )
+                with self.assertRaisesRegex(
+                    parsedmarc.InvalidAggregateReport, "Conflicting identifiers"
+                ):
+                    self._parse(
+                        f"<identifiers>{canonical}</identifiers><identities>{legacy}</identities>"
+                    )
+
+    def test_malformed_or_repeated_identifiers_are_rejected(self):
+        """RFC 9990 section 3.1.1.10 requires one header_from domain."""
+        valid = "<identifiers><header_from>example.com</header_from></identifiers>"
+        cases = (
+            "",
+            "<identifiers/>",
+            "<identifiers>example.com</identifiers>",
+            "<identifiers><envelope_from>example.com</envelope_from></identifiers>",
+            "<identifiers><header_from/></identifiers>",
+            "<identifiers><header_from> </header_from></identifiers>",
+            "<identifiers><header_from><domain>example.com</domain></header_from></identifiers>",
+            "<identifiers><header_from>example.com</header_from><header_from>different.example</header_from></identifiers>",
+            "<identifiers><header_from>example.com</header_from><envelope_from>a.example</envelope_from><envelope_from>b.example</envelope_from></identifiers>",
+            valid + valid,
+            valid + "<identities/>",
+            valid + "<identities>example.com</identities>",
+            valid + "<identities><header_from/></identities>",
+            "<identifiers/>" + valid.replace("identifiers", "identities"),
+        )
+        for identifiers in cases:
+            with self.subTest(identifiers=identifiers):
+                with self.assertRaises(parsedmarc.InvalidAggregateReport):
+                    self._parse(identifiers)
 
 
 class TestExtractReport(unittest.TestCase):
