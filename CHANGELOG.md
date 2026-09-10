@@ -23,6 +23,8 @@
 
 - Reject an aggregate report when any record cannot be parsed or no records survive, instead of silently returning partial counts or an empty successful result. Record failures identify the one-based row number; mailbox ingestion routes these reports to Invalid.
 
+- **Failure report discovery no longer enters the original message sample.** XML attachments, SMTP TLS reports, and nested messages inside the sample cannot replace or invalidate the enclosing failure report or substitute a different sample.
+
 - `find_unknown_base_reverse_dns.py`'s missing-file checks for `base_reverse_dns_map.csv` and the `known_unknown`/PSL-override lists printed a clean error message but fell through into an unhandled `FileNotFoundError` traceback instead of exiting.
 
 ### Bug fixes

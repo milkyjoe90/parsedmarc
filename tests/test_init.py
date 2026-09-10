@@ -20,6 +20,8 @@ import time
 import unittest
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+from email.mime.application import MIMEApplication
+from email.mime.message import MIMEMessage
 from email.mime.multipart import MIMEMultipart
 from email.mime.nonmultipart import MIMENonMultipart
 from email.mime.text import MIMEText
@@ -3048,6 +3050,48 @@ class TestParseReportFile(unittest.TestCase):
 class TestParseReportEmail(unittest.TestCase):
     """Tests for parse_report_email edge cases"""
 
+    def testFailureSampleSubtreeCannotReplaceReport(self):
+        """RFC 6591 §3.1 makes the third MIME part an opaque original sample.
+
+        Nested XML, TLS reports, and messages must neither replace the
+        outer failure report nor change its original sender and subject.
+        """
+        aggregate = Path("samples/aggregate/rfc9990-sample.xml").read_bytes()
+        tls = Path("samples/smtp_tls/rfc8460.json").read_bytes()
+        attachments = {
+            "invoice": MIMEApplication(b"<invoice>sample data</invoice>", "xml"),
+            "aggregate": MIMEApplication(aggregate, "xml"),
+            "tls": MIMEApplication(tls, "tlsrpt+json"),
+            "nested_message": MIMEMessage(
+                email.message_from_string(
+                    "From: different@nested.example\nSubject: Nested subject\n\nbody"
+                )
+            ),
+            "nested_failure": MIMEMessage(
+                email.message_from_string(build_failure_report_email())
+            ),
+        }
+        for name, attachment in attachments.items():
+            with self.subTest(attachment=name):
+                sample = MIMEMultipart()
+                sample["From"] = "victim@original.example"
+                sample["Subject"] = "Original subject"
+                sample.attach(MIMEText("Original body"))
+                sample.attach(attachment)
+                message = email.message_from_string(build_failure_report_email())
+                parts = message.get_payload()
+                assert isinstance(parts, list)
+                parts[-1] = MIMEMessage(sample)
+                result = parsedmarc.parse_report_email(message.as_bytes(), offline=True)
+                self.assertEqual(result["report_type"], "failure")
+                report = cast(FailureReport, result["report"])
+                self.assertEqual(report["reported_domain"], "original.example")
+                self.assertEqual(
+                    report["parsed_sample"].get("subject"), "Original subject"
+                )
+                self.assertIn("Original body", report["sample"])
+                self.assertIn(attachment.get_content_type(), report["sample"])
+
     def testSmtpTlsEmailReport(self):
         """parse_report_email handles SMTP TLS reports in email format"""
         eml_path = "samples/smtp_tls/google.com_smtp_tls_report.eml"
@@ -3413,10 +3457,6 @@ class TestGetDmarcReportsFromMbox(unittest.TestCase):
 
     def testMboxWithAggregateReport(self):
         """Mbox with aggregate report email is parsed"""
-        from email.mime.multipart import MIMEMultipart
-        from email.mime.application import MIMEApplication
-        import gzip
-
         xml = b"""<?xml version="1.0"?>
 <feedback>
   <report_metadata>

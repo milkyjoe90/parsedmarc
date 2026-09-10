@@ -2203,9 +2203,25 @@ def parse_report_email(
         logger.info("Parsing mail from {} on {}".format(msg_headers["From"], date))
     if "Subject" in msg_headers:
         subject = msg_headers["Subject"]
-    for part in msg.walk():
+    pending_parts = [msg]
+    while pending_parts:
+        part = pending_parts.pop()
         content_type = part.get_content_type().lower()
         payload_obj = part.get_payload()
+        # RFC 6591 §3.1: the original message is the report's sample, not
+        # another report container. Keep its entire subtree opaque, even
+        # when it contains attachments or another message/feedback-report.
+        is_sample = is_feedback_report and content_type in EMAIL_SAMPLE_CONTENT_TYPES
+        if (
+            isinstance(payload_obj, list)
+            and not is_sample
+            and content_type != "message/feedback-report"
+        ):
+            pending_parts.extend(
+                child
+                for child in reversed(payload_obj)
+                if isinstance(child, email.message.Message)
+            )
         if not isinstance(payload_obj, list):
             payload_obj = [payload_obj]
         payload = str(payload_obj[0])
