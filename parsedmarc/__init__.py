@@ -98,6 +98,11 @@ xml_namespace_regex = re.compile(
 # The XML namespace assigned to DMARC aggregate reports by RFC 9990.
 RFC_9990_NAMESPACE = "urn:ietf:params:xml:ns:dmarc-2.0"
 
+# Implementation safety limits, not RFC validity requirements. Reports are
+# normally daily; a full leap year accommodates delayed/batched reporters.
+_MAX_AGGREGATE_SPAN_SECONDS = 366 * 86400
+_MAX_AGGREGATE_NORMALIZATION_BUCKETS = 100_000
+
 # PolicyOverrideType enumeration from RFC 9990. Compared to RFC 7489,
 # `policy_test_mode` was added (emitted when t=y suppresses enforcement)
 # and `forwarded` / `sampled_out` were removed.
@@ -338,6 +343,8 @@ def _bucket_interval_by_day(
 
     # --- Short-circuit trivial cases -----------------------------------------
     interval_seconds = (end - begin).total_seconds()
+    if interval_seconds > _MAX_AGGREGATE_SPAN_SECONDS:
+        raise ValueError("Aggregate reporting period exceeds the 366-day safety limit")
     if interval_seconds <= 0 or total_count == 0:
         return []
 
@@ -901,6 +908,56 @@ def parsed_smtp_tls_reports_to_csv(
     return csv_file_object.getvalue()
 
 
+def _validate_aggregate_record_budget(
+    raw_records: Any,
+    begin_ts: int,
+    end_ts: int,
+    normalize_timespan_threshold_hours: float,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Validate periods, record counts and total expansion before enrichment.
+
+    The span cap always applies. The record/day budget applies only when
+    normalization is required; these are implementation safety limits.
+    Malformed records raise InvalidAggregateReport with their row number.
+    """
+    span_seconds = end_ts - begin_ts
+    if span_seconds < 0:
+        raise InvalidAggregateReport("Report end precedes begin")
+    if span_seconds > _MAX_AGGREGATE_SPAN_SECONDS:
+        raise InvalidAggregateReport(
+            "Aggregate reporting period exceeds the 366-day safety limit"
+        )
+
+    normalize_timespan = span_seconds > normalize_timespan_threshold_hours * 3600
+
+    if raw_records is None:
+        raise InvalidAggregateReport("Report must contain at least one record")
+    if not isinstance(raw_records, list):
+        raw_records = [raw_records]
+
+    # Reject the whole expansion before IP enrichment or daily allocation.
+    # UTC days intersecting [begin, end), including partial boundary days.
+    bucket_count = (end_ts + 86399) // 86400 - begin_ts // 86400
+    if (
+        normalize_timespan
+        and len(raw_records) * bucket_count > _MAX_AGGREGATE_NORMALIZATION_BUCKETS
+    ):
+        raise InvalidAggregateReport(
+            "Aggregate normalization exceeds the 100000-bucket safety limit"
+        )
+    for i, raw_record in enumerate(raw_records):
+        try:
+            count = int(raw_record["row"]["count"])
+            if count < 0:
+                raise ValueError("Message count must be non-negative")
+        except (KeyError, TypeError, ValueError) as error:
+            raise InvalidAggregateReport(
+                f"Could not parse record {i + 1}: {error}"
+            ) from error
+
+    return raw_records, normalize_timespan
+
+
 def _aggregate_key_text(
     value: Any, field_name: str, *, allow_empty: bool = False
 ) -> str | None:
@@ -936,6 +993,11 @@ def parse_aggregate_report_xml(
     config: ParserConfig | None = None,
 ) -> AggregateReport:
     """Parses a DMARC XML report string and returns a consistent dict
+
+    Reporting periods are limited to 366 days. When normalization is required,
+    the input record count times the number of intersected UTC days must not
+    exceed 100,000. These implementation safety limits apply before enrichment
+    and expansion; they are not RFC requirements.
 
     Args:
         xml (str | bytes): DMARC aggregate report XML (bytes are decoded
@@ -1070,9 +1132,11 @@ def parse_aggregate_report_xml(
         begin_ts = int(date_range["begin"].split(".")[0])
         end_ts = int(date_range["end"].split(".")[0])
         span_seconds = end_ts - begin_ts
-
-        normalize_timespan = (
-            span_seconds > cfg.normalize_timespan_threshold_hours * 3600
+        raw_records, normalize_timespan = _validate_aggregate_record_budget(
+            report.get("record"),
+            begin_ts,
+            end_ts,
+            cfg.normalize_timespan_threshold_hours,
         )
 
         # Epochs in aggregate reports are UTC (RFC 9990 section 3.1.1.4).
@@ -1171,11 +1235,6 @@ def parse_aggregate_report_xml(
         new_policy_published["discovery_method"] = discovery_method
         new_report["policy_published"] = new_policy_published
 
-        raw_records = report.get("record")
-        if raw_records is None:
-            raise InvalidAggregateReport("Report must contain at least one record")
-        if not isinstance(raw_records, list):
-            raw_records = [raw_records]
         for i, raw_record in enumerate(raw_records):
             if keep_alive is not None and i > 0 and i % 20 == 0:
                 logger.debug("Sending keepalive cmd")

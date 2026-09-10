@@ -177,7 +177,12 @@ The full set of configuration options is:
       single line without indentation (Default: `True`)
   - `normalize_timespan_threshold_hours` - float: Aggregate reports
       covering a longer time span than this many hours have their
-      records normalized into per-day records (Default: `24`)
+      records normalized into per-day records (Default: `24`). As fixed
+      implementation safety limits, reporting periods over 366 days are
+      rejected regardless of this setting, and normalization is rejected
+      when the number of input records multiplied by the number of UTC
+      days intersected exceeds 100,000. These limits apply before IP
+      enrichment and expansion; they are not RFC requirements.
   - `ip_db_path` - str: An optional custom path to a MMDB file
       from IPinfo, MaxMind, or DBIP
   - `ipinfo_url` - str: Overrides the default download URL for the

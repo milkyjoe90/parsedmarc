@@ -17,6 +17,8 @@
 
 - Aggregate ingestion now deduplicates by reporting organization, contact email, policy domain and the full Report-ID. IDs retain their `@` suffix and surrounding angle brackets in parsed output; the optional brackets are normalized only for duplicate comparison. Distinct customer reports and full IDs no longer collide in CLI, mailbox or mbox ingestion. Malformed organization, contact-email and policy-domain shapes are rejected during parsing before they can abort ingestion during duplicate comparison.
 
+- Bound aggregate normalization before IP enrichment or expansion: reject periods over 366 days and normalization requiring more than 100,000 record/day buckets per report. These fixed implementation safety limits prevent small inputs from causing unbounded daily expansion. Also reject inverted reporting periods and negative message counts, including reports below the normalization threshold.
+
 - Convert aggregate report epochs directly to UTC, keeping metadata, record intervals, and CSV dates consistent regardless of the host timezone or daylight-saving transitions.
 
 - Reject an aggregate report when any record cannot be parsed or no records survive, instead of silently returning partial counts or an empty successful result. Record failures identify the one-based row number; mailbox ingestion routes these reports to Invalid.

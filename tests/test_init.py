@@ -5525,6 +5525,97 @@ def _minimal_aggregate_xml(
     </feedback>"""
 
 
+class TestAggregateNormalizationLimits(unittest.TestCase):
+    """Implementation limits against the report-content attacks in RFC 9990 8.1.
+
+    https://www.rfc-editor.org/rfc/rfc9990.html#section-8.1
+    The chosen 366-day and 100,000-bucket boundaries are parser safety policy,
+    not RFC-defined maximums.
+    """
+
+    def _xml(self, *, days=1, extra_seconds=0, rows=1, count=1, start_offset=0):
+        xml = (
+            _minimal_aggregate_xml()
+            .replace("1704067200", str(1704067200 + start_offset))
+            .replace(
+                "1704153599",
+                str(1704067200 + start_offset + days * 86400 + extra_seconds),
+            )
+        )
+        record = xml[xml.index("<record>") : xml.index("</record>") + 9]
+        return xml.replace(
+            record, record.replace("<count>1</count>", f"<count>{count}</count>") * rows
+        )
+
+    def testSpanBoundaryAndThresholdBypass(self):
+        """RFC 9990 8.1 safety policy bounds spans even without normalization."""
+        for threshold in (24.0, 1e10):
+            with self.subTest(threshold=threshold):
+                report = parsedmarc.parse_aggregate_report_xml(
+                    self._xml(days=366, count=366),
+                    offline=True,
+                    normalize_timespan_threshold_hours=threshold,
+                )
+                self.assertEqual(sum(row["count"] for row in report["records"]), 366)
+                self.assertEqual(
+                    len(report["records"]), 366 if threshold == 24.0 else 1
+                )
+                with self.assertRaisesRegex(
+                    parsedmarc.InvalidAggregateReport, "366-day"
+                ):
+                    parsedmarc.parse_aggregate_report_xml(
+                        self._xml(days=366, extra_seconds=1),
+                        offline=True,
+                        normalize_timespan_threshold_hours=threshold,
+                    )
+
+    def testTotalNormalizationBudgetBoundary(self):
+        """RFC 9990 8.1 safety policy applies across all rows, not per row."""
+        report = parsedmarc.parse_aggregate_report_xml(
+            self._xml(days=250, rows=400, count=250), offline=True
+        )
+        self.assertEqual(len(report["records"]), 100_000)
+        self.assertEqual(sum(row["count"] for row in report["records"]), 100_000)
+        for count in (1, 250):
+            with self.subTest(count=count):
+                with self.assertRaisesRegex(
+                    parsedmarc.InvalidAggregateReport, "100000-bucket"
+                ):
+                    parsedmarc.parse_aggregate_report_xml(
+                        self._xml(days=250, rows=401, count=count), offline=True
+                    )
+        # A noon start intersects 251 days, despite lasting exactly 250 days.
+        with self.assertRaisesRegex(parsedmarc.InvalidAggregateReport, "100000-bucket"):
+            parsedmarc.parse_aggregate_report_xml(
+                self._xml(days=250, rows=400, start_offset=43200), offline=True
+            )
+
+    def testInvertedRangeAndNegativeCountsAreRejected(self):
+        """RFC 9990 3.1.1.4/3.1.1.8 define periods and message counts.
+
+        https://www.rfc-editor.org/rfc/rfc9990.html#section-3.1.1.8
+        These cannot describe a negative duration or a negative message count.
+        """
+        for xml, expected in (
+            (self._xml(days=-1), "end precedes begin"),
+            (self._xml(count=-1), "non-negative"),
+            (self._xml(days=3, count=-1, rows=2), "record 1"),
+        ):
+            with self.subTest(expected=expected):
+                with self.assertRaisesRegex(
+                    parsedmarc.InvalidAggregateReport, expected
+                ):
+                    parsedmarc.parse_aggregate_report_xml(xml, offline=True)
+
+    def testBucketHelperRejectsOversizedSpanBeforeAllocation(self):
+        """RFC 9990 8.1 safety policy also applies to the bucket helper itself."""
+        begin = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        with self.assertRaisesRegex(ValueError, "366-day"):
+            parsedmarc._bucket_interval_by_day(
+                begin, begin + timedelta(days=366, seconds=1), 100_000
+            )
+
+
 class TestAggregateReportEdgeCases(unittest.TestCase):
     """Parsing edge cases for aggregate report XML documents."""
 
