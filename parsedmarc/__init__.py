@@ -7,6 +7,7 @@ from __future__ import annotations
 import binascii
 import email
 import email.errors
+import email.headerregistry
 import email.message
 import email.utils
 import functools
@@ -25,8 +26,10 @@ import zlib
 from base64 import b64decode
 from collections import deque
 from collections.abc import Callable, Sequence
+from copy import deepcopy
 from csv import DictWriter
 from datetime import date, datetime, timedelta, timezone, tzinfo
+from email.policy import default as default_email_policy
 from io import BytesIO, StringIO
 from typing import (
     Any,
@@ -2030,9 +2033,9 @@ def _decode_mime_payload(part: email.message.Message, fallback: str) -> str:
     Three non-obvious constraints shape this helper:
 
     - Only ``quoted-printable`` and ``base64`` parts are touched at all. The
-      caller parses the message from a ``str``, so for a part with a 7bit,
+      caller may parse the message from a ``str``. For a part with a 7bit,
       8bit, or absent ``Content-Transfer-Encoding`` there is nothing to undo,
-      and ``compat32``'s ``get_payload(decode=True)`` would round-trip the
+      and ``compat32``'s ``get_payload(decode=True)`` would round-trip that
       already-correct text through ``raw-unicode-escape`` bytes — re-decoding
       those as the declared charset mangles every non-ASCII character. Such
       parts return ``fallback``, which is the payload text as-is.
@@ -2107,6 +2110,54 @@ def _decode_mime_payload(part: email.message.Message, fallback: str) -> str:
         return fallback
 
 
+def _decode_report_attachment(
+    part: email.message.Message, payload: str, *, preserve_bytes: bool
+) -> bytes | None:
+    """Decode an attachment's CTE without converting compressed bytes to text.
+
+    RFC 2045 §6 defines 7bit, 8bit, and binary as identity encodings.
+    Undeclared base64 remains supported for legacy reporters, but only when
+    the undecoded body does not already start with report content.
+    """
+    if part.is_multipart():
+        return None
+    raw_cte = part.get("Content-Transfer-Encoding") or ""
+    cte = ""
+    if raw_cte:
+        # RFC 2045 section 1 allows comments in MIME headers. The public
+        # fetch parser unfolds the value before the header registry handles
+        # CFWS, including nested comments.
+        header = default_email_policy.header_fetch_parse(
+            "Content-Transfer-Encoding", raw_cte
+        )
+        if header.defects:
+            return None
+        assert isinstance(header, email.headerregistry.ContentTransferEncodingHeader)
+        cte = header.cte
+    if cte not in ("", "7bit", "8bit", "binary", "base64", "quoted-printable"):
+        return None
+    if preserve_bytes or cte in ("base64", "quoted-printable"):
+        if raw_cte and raw_cte != cte:
+            # compat32 payload decoding compares the raw header literally.
+            # Normalize a leaf copy so decoding honors the parsed token,
+            # without rewriting the source part or converting binary data.
+            part = deepcopy(part)
+            part.replace_header("Content-Transfer-Encoding", cte)
+        decoded = part.get_payload(decode=True)
+        if not isinstance(decoded, bytes):
+            return None
+    else:
+        decoded = payload.encode("utf-8")
+    if not cte and not decoded.lstrip().startswith(
+        (MAGIC_ZIP, MAGIC_GZIP, MAGIC_XML_TAG, MAGIC_JSON)
+    ):
+        try:
+            return b64decode(decoded)
+        except (ValueError, binascii.Error):
+            pass
+    return decoded
+
+
 def parse_report_email(
     input_: bytes | str,
     *,
@@ -2169,6 +2220,7 @@ def parse_report_email(
     msg_date: datetime = datetime.now(timezone.utc)
 
     try:
+        mime_bytes: bytes | None = None
         input_data: str | bytes | bytearray | memoryview = input_
         if isinstance(input_data, (bytes, bytearray, memoryview)):
             input_bytes = bytes(input_data)
@@ -2181,6 +2233,7 @@ def parse_report_email(
                         encoding="utf8", errors="replace"
                     )
             else:
+                mime_bytes = input_bytes
                 input_str = input_bytes.decode(encoding="utf8", errors="replace")
         else:
             input_str = input_data
@@ -2190,7 +2243,11 @@ def parse_report_email(
         if "Date" in msg_headers:
             msg_date = human_timestamp_to_datetime(msg_headers["Date"])
         date = email.utils.format_datetime(msg_date)
-        msg = email.message_from_string(input_str)
+        msg = (
+            email.message_from_bytes(mime_bytes)
+            if mime_bytes is not None
+            else email.message_from_string(input_str)
+        )
 
     except Exception as e:
         raise ParserError(e.__str__() + _exc_origin(e)) from e
@@ -2244,15 +2301,6 @@ def parse_report_email(
                 feedback_report = decoded_payload
         elif is_feedback_report and content_type in EMAIL_SAMPLE_CONTENT_TYPES:
             sample = _decode_mime_payload(part, payload)
-        elif content_type == "application/tlsrpt+json":
-            if not payload.strip().startswith("{"):
-                payload = b64decode(payload).decode("utf-8", errors="replace")
-            smtp_tls_report = parse_smtp_tls_report_json(payload)
-            return {"report_type": "smtp_tls", "report": smtp_tls_report}
-        elif content_type == "application/tlsrpt+gzip":
-            payload = extract_report(payload)
-            smtp_tls_report = parse_smtp_tls_report_json(payload)
-            return {"report_type": "smtp_tls", "report": smtp_tls_report}
         elif content_type == "text/plain":
             if "A message claiming to be from you has failed" in payload:
                 try:
@@ -2274,7 +2322,11 @@ def parse_report_email(
                 logger.debug(sample)
         else:
             try:
-                payload_bytes = b64decode(payload)
+                payload_bytes = _decode_report_attachment(
+                    part, payload, preserve_bytes=mime_bytes is not None
+                )
+                if payload_bytes is None:
+                    continue
                 if payload_bytes.startswith(MAGIC_ZIP) or payload_bytes.startswith(
                     MAGIC_GZIP
                 ):
@@ -2282,7 +2334,10 @@ def parse_report_email(
                 else:
                     payload_text = payload_bytes.decode("utf-8", errors="replace")
 
-                if payload_text.strip().startswith("{"):
+                if content_type in (
+                    "application/tlsrpt+json",
+                    "application/tlsrpt+gzip",
+                ) or payload_text.strip().startswith("{"):
                     smtp_tls_report = parse_smtp_tls_report_json(payload_text)
                     result = {"report_type": "smtp_tls", "report": smtp_tls_report}
                     return result
@@ -2297,10 +2352,9 @@ def parse_report_email(
                     return result
 
             except (TypeError, ValueError, binascii.Error):
-                # b64decode() rejected this MIME part's payload as not
-                # base64-decodable, so it isn't a report attachment; fall
-                # through and keep walking the message for a part (or the
-                # feedback-report/sample pair below) that is.
+                # This MIME part could not be transfer-decoded. Continue
+                # discovery; malformed report content itself is reported
+                # by the specific parser exceptions below.
                 pass
 
             except InvalidDMARCReport as e:
@@ -2308,6 +2362,13 @@ def parse_report_email(
                     f'Message with subject "{subject}" is not a valid DMARC report: {e}'
                 )
                 raise ParserError(error) from e
+
+            except InvalidSMTPTLSReport as e:
+                # TLS attachments retain their public invalid-input subtype
+                # after moving into the shared transfer-decoding path.
+                raise InvalidSMTPTLSReport(
+                    f'Message with subject "{subject}" is not a valid SMTP TLS report: {e}'
+                ) from e
 
             except Exception as e:
                 error = f'Unable to parse message with subject "{subject}": {e}{_exc_origin(e)}'

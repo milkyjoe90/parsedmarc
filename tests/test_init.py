@@ -3092,6 +3092,202 @@ class TestParseReportEmail(unittest.TestCase):
                 self.assertIn("Original body", report["sample"])
                 self.assertIn(attachment.get_content_type(), report["sample"])
 
+    def testAggregateAttachmentTransferEncodings(self):
+        """RFC 2045 §6: decode declared CTE before reading report content."""
+        from email.mime.application import MIMEApplication
+
+        xml = Path("samples/aggregate/rfc9990-sample.xml").read_bytes()
+        expected = parsedmarc.parse_aggregate_report_xml(xml, offline=True)
+        for cte in (None, "7bit", "base64", "quoted-printable"):
+            for as_bytes in (False, True):
+                with self.subTest(cte=cte, as_bytes=as_bytes):
+                    attachment = MIMEApplication(xml, "xml")
+                    del attachment["Content-Transfer-Encoding"]
+                    if cte == "base64":
+                        payload = base64.b64encode(xml).decode()
+                    elif cte == "quoted-printable":
+                        payload = quopri.encodestring(xml).decode()
+                    else:
+                        payload = xml.decode()
+                    attachment.set_payload(payload)
+                    if cte:
+                        attachment["Content-Transfer-Encoding"] = cte
+                    message = MIMEMultipart()
+                    message["Subject"] = "Aggregate report"
+                    # An unrelated attachment must not block discovery.
+                    message.attach(MIMEApplication(b"unrelated bytes", "pdf"))
+                    message.attach(attachment)
+                    content = message.as_bytes() if as_bytes else message.as_string()
+                    result = parsedmarc.parse_report_email(content, offline=True)
+                    self.assertEqual(result["report_type"], "aggregate")
+                    self.assertEqual(result["report"], expected)
+
+    def testAttachmentDiscoverySkipsUnusableParts(self):
+        """RFC 2045 §6: unknown CTE cannot identify another part's payload.
+
+        Unrelated parts and a forwarded message wrapper do not prevent
+        discovery of the actual report in the forwarded message.
+        """
+        from email.mime.application import MIMEApplication
+        from email.mime.message import MIMEMessage
+
+        xml = Path("samples/aggregate/rfc9990-sample.xml").read_bytes()
+        expected = parsedmarc.parse_aggregate_report_xml(xml, offline=True)
+        unknown_cte = MIMENonMultipart("application", "octet-stream")
+        unknown_cte["Content-Transfer-Encoding"] = "x-unknown"
+        unknown_cte.set_payload("unrelated attachment")
+        undeclared = MIMENonMultipart("application", "octet-stream")
+        undeclared.set_payload("a")  # Neither report text nor valid Base64.
+        empty = MIMENonMultipart("application", "octet-stream")
+        self.assertIsNone(
+            parsedmarc._decode_report_attachment(empty, "", preserve_bytes=True)
+        )
+        forwarded = MIMEMultipart()
+        forwarded["Subject"] = "Forwarded aggregate report"
+        forwarded.attach(MIMEApplication(xml, "xml"))
+        message = MIMEMultipart()
+        message.attach(unknown_cte)
+        message.attach(undeclared)
+        message.attach(empty)
+        message.attach(MIMEMessage(forwarded))
+        result = parsedmarc.parse_report_email(message.as_bytes(), offline=True)
+        self.assertEqual(result["report_type"], "aggregate")
+        self.assertEqual(result["report"], expected)
+
+    def testCommentedAttachmentTransferEncodings(self):
+        """RFC 2045 §1: comments have no semantic content in MIME headers.
+
+        https://datatracker.ietf.org/doc/html/rfc2045#section-1
+        ContentTransferEncodingHeader.cte parses that token, while compat32
+        payload decoding also needs the canonical header value to decode it.
+        """
+        xml = Path("samples/aggregate/rfc9990-sample.xml").read_bytes()
+        expected = parsedmarc.parse_aggregate_report_xml(xml, offline=True)
+        for compressed in (False, True):
+            for cte in (
+                "binary" if compressed else "7bit",
+                "base64",
+                "quoted-printable",
+            ):
+                decoded_payload = gzip.compress(xml, mtime=0) if compressed else xml
+                payload = decoded_payload
+                if cte == "base64":
+                    payload = base64.b64encode(payload)
+                elif cte == "quoted-printable":
+                    payload = quopri.encodestring(payload)
+                for declaration in (
+                    f"{cte} (mime comment)",
+                    f"(nested (comment)) {cte}",
+                    f"(escaped \\) comment)\r\n {cte} (trailing)",
+                ):
+                    with self.subTest(compressed=compressed, declaration=declaration):
+                        content_type = "gzip" if compressed else "xml"
+                        headers = (
+                            f"Content-Type: application/{content_type}\r\n"
+                            f"Content-Transfer-Encoding: {declaration}\r\n\r\n"
+                        ).encode()
+                        content = headers + payload
+                        inputs: list[bytes | str] = [content]
+                        if not compressed:
+                            inputs.append(content.decode())
+                        for input_ in inputs:
+                            result = parsedmarc.parse_report_email(input_, offline=True)
+                            self.assertEqual(result["report_type"], "aggregate")
+                            self.assertEqual(result["report"], expected)
+                        part = email.message_from_bytes(content)
+                        original_header = part["Content-Transfer-Encoding"]
+                        self.assertEqual(
+                            parsedmarc._decode_report_attachment(
+                                part, str(part.get_payload()), preserve_bytes=True
+                            ),
+                            decoded_payload,
+                        )
+                        self.assertEqual(
+                            part["Content-Transfer-Encoding"], original_header
+                        )
+
+    def testMalformedTransferDeclarationsAreNotTreatedAsBase64(self):
+        """RFC 2045 §6.1 requires one transfer-encoding token, not extra text."""
+        xml = Path("samples/aggregate/rfc9990-sample.xml").read_bytes()
+        for declaration in ("base64 (unterminated", "base64 garbage"):
+            with self.subTest(declaration=declaration):
+                content = (
+                    f"Content-Type: application/xml\r\n"
+                    f"Content-Transfer-Encoding: {declaration}\r\n\r\n"
+                ).encode() + base64.b64encode(xml)
+                with self.assertRaises(parsedmarc.InvalidDMARCReport):
+                    parsedmarc.parse_report_email(content, offline=True)
+
+    def testMalformedTlsAttachmentsPreserveInvalidReportSubtype(self):
+        """InvalidSMTPTLSReport's public ParserError subtype survives MIME decoding.
+
+        RFC 8460 §4.4 defines the required fields of the JSON report.
+        https://www.rfc-editor.org/rfc/rfc8460.html#section-4.4
+        """
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed):
+                payload = gzip.compress(b"{}") if compressed else b"{}"
+                content_type = "gzip" if compressed else "json"
+                headers = (
+                    f"Content-Type: application/tlsrpt+{content_type}\r\n"
+                    "Content-Transfer-Encoding: base64\r\n\r\n"
+                ).encode()
+                with self.assertRaises(parsedmarc.InvalidSMTPTLSReport):
+                    parsedmarc.parse_report_email(
+                        headers + base64.b64encode(payload), offline=True
+                    )
+
+    def testCompressedAttachmentBytesSurviveTransferDecoding(self):
+        """RFC 2045 §6.2: binary is an identity transform, including gzip."""
+        xml = Path("samples/aggregate/rfc9990-sample.xml").read_bytes()
+        expected = parsedmarc.parse_aggregate_report_xml(xml, offline=True)
+        compressed = gzip.compress(xml)
+        for cte in ("binary", "base64", "quoted-printable", None):
+            with self.subTest(cte=cte):
+                if cte in ("base64", None):
+                    payload = base64.b64encode(compressed)
+                elif cte == "quoted-printable":
+                    payload = quopri.encodestring(compressed)
+                else:
+                    payload = compressed
+                headers = (
+                    b"Subject: Compressed report\nContent-Type: application/gzip\n"
+                )
+                if cte:
+                    headers += f"Content-Transfer-Encoding: {cte}\n".encode()
+                result = parsedmarc.parse_report_email(
+                    headers + b"\n" + payload, offline=True
+                )
+                self.assertEqual(result["report_type"], "aggregate")
+                self.assertEqual(result["report"], expected)
+
+    def testTlsAttachmentTransferEncodings(self):
+        """RFC 8460 §5.3 and RFC 2045 §6: TLS JSON honors its MIME encoding."""
+        data = Path("samples/smtp_tls/rfc8460.json").read_bytes()
+        expected = parsedmarc.parse_smtp_tls_report_json(data.decode())
+        for compressed in (False, True):
+            for cte in (
+                "binary" if compressed else "7bit",
+                "base64",
+                "quoted-printable",
+            ):
+                with self.subTest(compressed=compressed, cte=cte):
+                    payload = gzip.compress(data) if compressed else data
+                    if cte == "base64":
+                        payload = base64.b64encode(payload)
+                    elif cte == "quoted-printable":
+                        payload = quopri.encodestring(payload)
+                    content_type = "gzip" if compressed else "json"
+                    headers = (
+                        f"Content-Type: application/tlsrpt+{content_type}\n"
+                        f"Content-Transfer-Encoding: {cte}\n\n"
+                    ).encode()
+                    result = parsedmarc.parse_report_email(
+                        headers + payload, offline=True
+                    )
+                    self.assertEqual(result["report_type"], "smtp_tls")
+                    self.assertEqual(result["report"], expected)
+
     def testSmtpTlsEmailReport(self):
         """parse_report_email handles SMTP TLS reports in email format"""
         eml_path = "samples/smtp_tls/google.com_smtp_tls_report.eml"
@@ -3169,9 +3365,9 @@ This is not a DMARC report."""
     def testAttachmentInvalidJsonRaises(self):
         """A base64 attachment of invalid SMTP TLS JSON is rejected.
 
-        parse_smtp_tls_report_json raises InvalidSMTPTLSReport, a sibling of
-        InvalidDMARCReport, so it falls through to the generic catch-all and
-        becomes a ParserError naming the subject.
+        The specific InvalidSMTPTLSReport subtype is retained along with
+        subject context, including when MIME discovery finds JSON in a
+        generic octet-stream attachment.
         """
         att = base64.b64encode(b"{not valid json").decode()
         eml = (
@@ -3179,7 +3375,7 @@ This is not a DMARC report."""
             "Content-Type: application/octet-stream\n"
             "Content-Transfer-Encoding: base64\n\n" + att + "\n"
         )
-        with self.assertRaises(parsedmarc.ParserError) as ctx:
+        with self.assertRaises(parsedmarc.InvalidSMTPTLSReport) as ctx:
             parsedmarc.parse_report_email(eml, offline=True)
         self.assertIn("Tls", str(ctx.exception))
 
