@@ -77,7 +77,6 @@ from parsedmarc.utils import (
     human_timestamp_to_datetime,
     is_outlook_msg,
     parse_email,
-    timestamp_to_human,
 )
 
 logger.debug(f"parsedmarc v{__version__}")
@@ -1076,19 +1075,14 @@ def parse_aggregate_report_xml(
             span_seconds > cfg.normalize_timespan_threshold_hours * 3600
         )
 
-        date_range["begin"] = timestamp_to_human(begin_ts)
-        date_range["end"] = timestamp_to_human(end_ts)
-
-        new_report_metadata["begin_date"] = date_range["begin"]
-        new_report_metadata["end_date"] = date_range["end"]
+        # Epochs in aggregate reports are UTC (RFC 9990 section 3.1.1.4).
+        # A round trip through local naive strings loses DST-fold information.
+        begin_dt = datetime.fromtimestamp(begin_ts, timezone.utc)
+        end_dt = datetime.fromtimestamp(end_ts, timezone.utc)
+        new_report_metadata["begin_date"] = begin_dt.strftime("%Y-%m-%d %H:%M:%S")
+        new_report_metadata["end_date"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
         new_report_metadata["timespan_requires_normalization"] = normalize_timespan
         new_report_metadata["original_timespan_seconds"] = span_seconds
-        begin_dt = human_timestamp_to_datetime(
-            new_report_metadata["begin_date"], to_utc=True
-        )
-        end_dt = human_timestamp_to_datetime(
-            new_report_metadata["end_date"], to_utc=True
-        )
 
         # <error> is langAttrString in RFC 9990 (xs:string in RFC 7489) and
         # was cardinality-narrowed from "unbounded" to "1" in RFC 9990, but

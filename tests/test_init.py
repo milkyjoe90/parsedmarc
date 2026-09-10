@@ -16,6 +16,7 @@ import logging
 import mailbox
 import os
 import quopri
+import time
 import unittest
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -5559,6 +5560,55 @@ class TestAggregateReportEdgeCases(unittest.TestCase):
             offline=True,
         )
         self.assertEqual([row["count"] for row in report["records"]], [1, 7])
+
+    @unittest.skipUnless(
+        hasattr(time, "tzset"), "host timezone switching requires tzset"
+    )
+    def testAggregateEpochsStayUTCInEveryHostTimezone(self):
+        """RFC 9990 section 3.1.1.4 defines date_range in UTC.
+
+        https://www.rfc-editor.org/rfc/rfc9990.html#section-3.1.1.4
+        Python's datetime.fromtimestamp requires an explicit timezone to avoid
+        local time: https://docs.python.org/3/library/datetime.html#datetime.datetime.fromtimestamp
+        Metadata, row intervals, and CSV must agree through summer and DST folds.
+        """
+        for zone in ("UTC", "Europe/London", "America/New_York"):
+            for begin_text in ("2026-07-01 00:00:00", "2026-10-25 01:15:00"):
+                with self.subTest(zone=zone, begin=begin_text):
+                    begin = datetime.strptime(begin_text, "%Y-%m-%d %H:%M:%S").replace(
+                        tzinfo=timezone.utc
+                    )
+                    end = begin + timedelta(hours=1)
+                    xml = (
+                        _minimal_aggregate_xml()
+                        .replace("1704067200", str(int(begin.timestamp())))
+                        .replace("1704153599", str(int(end.timestamp())))
+                    )
+                    try:
+                        with patch.dict(os.environ, {"TZ": zone}):
+                            time.tzset()
+                            report = parsedmarc.parse_aggregate_report_xml(
+                                xml, offline=True
+                            )
+                    finally:
+                        time.tzset()
+                    end_text = end.strftime("%Y-%m-%d %H:%M:%S")
+                    self.assertEqual(
+                        report["report_metadata"]["begin_date"], begin_text
+                    )
+                    self.assertEqual(report["report_metadata"]["end_date"], end_text)
+                    self.assertEqual(
+                        report["report_metadata"]["original_timespan_seconds"], 3600
+                    )
+                    self.assertEqual(report["records"][0]["interval_begin"], begin_text)
+                    self.assertEqual(report["records"][0]["interval_end"], end_text)
+                    rows = list(
+                        csv.DictReader(
+                            StringIO(parsedmarc.parsed_aggregate_reports_to_csv(report))
+                        )
+                    )
+                    self.assertEqual(rows[0]["begin_date"], begin_text)
+                    self.assertEqual(rows[0]["end_date"], end_text)
 
     def testBytesInputIsDecoded(self):
         """parse_aggregate_report_xml accepts bytes input"""
