@@ -663,17 +663,13 @@ def _parse_report_record(
             new_result["human_result"] = _text(result.get("human_result"))
             new_record["auth_results"]["spf"].append(new_result)
 
-    # Backfill envelope_from from the last SPF result's domain when the
-    # reporter omitted the identifier or sent it empty.
-    if new_record["identifiers"].get("envelope_from") is None:
-        envelope_from = None
-        if len(auth_results["spf"]) > 0:
-            spf_result = auth_results["spf"][-1]
-            if "domain" in spf_result:
-                envelope_from = spf_result["domain"]
-        if envelope_from is not None:
-            envelope_from = str(envelope_from).lower()
-        new_record["identifiers"]["envelope_from"] = envelope_from
+    # RFC 9990 section 3.1.1.10 permits an empty envelope_from for a null
+    # reverse-path. Preserve that state separately from an omitted element;
+    # an SPF result (including a HELO check) is not a reported envelope sender.
+    if "envelope_from" not in new_record["identifiers"]:
+        new_record["identifiers"]["envelope_from"] = None
+    elif new_record["identifiers"]["envelope_from"] is None:
+        new_record["identifiers"]["envelope_from"] = ""
 
     envelope_to = None
     if "envelope_to" in new_record["identifiers"]:

@@ -1334,8 +1334,8 @@ class Test(unittest.TestCase):
             result["auth_results"]["spf"][0]["human_result"], "sender valid"
         )
 
-    def testParseReportRecordEnvelopeFromFallback(self):
-        """envelope_from falls back to last SPF domain when missing"""
+    def testParseReportRecordEnvelopeFromOmitted(self):
+        """RFC 9990 section 3.1.1.10: an omitted sender stays unknown."""
         record = {
             "row": {
                 "source_ip": "192.0.2.1",
@@ -1357,10 +1357,10 @@ class Test(unittest.TestCase):
         result = parsedmarc._parse_report_record(
             record, config=parsedmarc.ParserConfig(offline=True)
         )
-        self.assertEqual(result["identifiers"]["envelope_from"], "bounce.example.com")
+        self.assertIsNone(result["identifiers"]["envelope_from"])
 
-    def testParseReportRecordEnvelopeFromNullFallback(self):
-        """envelope_from None value falls back to SPF domain"""
+    def testParseReportRecordEnvelopeFromEmpty(self):
+        """RFC 9990 section 3.1.1.10: an empty element is a null reverse-path."""
         record = {
             "row": {
                 "source_ip": "192.0.2.1",
@@ -1385,12 +1385,12 @@ class Test(unittest.TestCase):
         result = parsedmarc._parse_report_record(
             record, config=parsedmarc.ParserConfig(offline=True)
         )
-        self.assertEqual(result["identifiers"]["envelope_from"], "spf.example.com")
+        self.assertEqual(result["identifiers"]["envelope_from"], "")
 
     def testParseReportRecordEnvelopeFromNullNoSpfDomain(self):
-        """envelope_from=None with SPF results that carry no domain must not
-        raise IndexError (regression: the branch gated on the raw SPF list but
-        indexed the filtered list, which is empty when no result has a domain)"""
+        """RFC 9990 section 3.1.1.10: a null reverse-path stays empty even
+        when the SPF results provide no domain.
+        """
         record = {
             "row": {
                 "source_ip": "192.0.2.1",
@@ -1414,7 +1414,7 @@ class Test(unittest.TestCase):
         result = parsedmarc._parse_report_record(
             record, config=parsedmarc.ParserConfig(offline=True)
         )
-        self.assertIsNone(result["identifiers"]["envelope_from"])
+        self.assertEqual(result["identifiers"]["envelope_from"], "")
 
     def testParseReportRecordEnvelopeTo(self):
         """envelope_to is preserved and moved correctly"""
@@ -2455,6 +2455,61 @@ class TestExtractReport(unittest.TestCase):
         xml = b'<?xml version="1.0"?><feedback></feedback>'
         result = parsedmarc.extract_report(gzip.compress(xml) + b"trailing garbage")
         self.assertEqual(result, xml.decode())
+
+
+class TestAggregateEnvelopeFrom(unittest.TestCase):
+    """Preserve sender provenance per RFC 9990 section 3.1.1.10 and RFC 7208
+    sections 2.3-2.4. SPF identities cannot fill missing report identifiers.
+
+    https://www.rfc-editor.org/rfc/rfc9990.html#section-3.1.1.10
+    https://www.rfc-editor.org/rfc/rfc7208.html#section-2.4
+    """
+
+    def test_reported_empty_missing_and_nonempty_senders_remain_distinct(self):
+        """RFC 9990 section 3.1.1.10 permits omitted and empty envelope_from."""
+        for scopes in ([], ["helo"], ["mfrom"], ["helo", "mfrom"], ["mfrom", "helo"]):
+            spf_results = "".join(
+                f"<spf><domain>{scope}.example</domain><scope>{scope}</scope><result>pass</result></spf>"
+                for scope in scopes
+            )
+            for envelope_xml, expected in (
+                ("", None),
+                ("<envelope_from/>", ""),
+                (
+                    "<envelope_from>Bounce.Example.COM</envelope_from>",
+                    "Bounce.Example.COM",
+                ),
+            ):
+                with self.subTest(scopes=scopes, envelope_xml=envelope_xml):
+                    report = parsedmarc.parse_aggregate_report_xml(
+                        f"""<feedback>
+                        <report_metadata><org_name>Reporter</org_name><email>reports@example.com</email>
+                        <report_id>envelope-test</report_id><date_range><begin>1788998400</begin>
+                        <end>1789084800</end></date_range></report_metadata>
+                        <policy_published><domain>example.com</domain><p>none</p></policy_published>
+                        <record><row><source_ip>192.0.2.1</source_ip><count>1</count>
+                        <policy_evaluated><disposition>none</disposition><dkim>pass</dkim><spf>fail</spf>
+                        </policy_evaluated></row><identifiers><header_from>example.com</header_from>
+                        {envelope_xml}</identifiers><auth_results>{spf_results}</auth_results>
+                        </record></feedback>""",
+                        offline=True,
+                    )
+                    record = report["records"][0]
+                    self.assertEqual(record["identifiers"]["envelope_from"], expected)
+                    self.assertEqual(
+                        [
+                            (spf["scope"], spf["domain"])
+                            for spf in record["auth_results"]["spf"]
+                        ],
+                        [(scope, f"{scope}.example") for scope in scopes],
+                    )
+                    self.assertEqual(
+                        record["alignment"], {"dkim": True, "spf": False, "dmarc": True}
+                    )
+                    rows = parsedmarc.parsed_aggregate_reports_to_csv_rows(report)
+                    # CSV renders both None and an empty sender as a blank
+                    # field; neither may be replaced by an SPF identity.
+                    self.assertEqual(rows[0]["envelope_from"], expected or "")
 
 
 class TestMalformedXmlRecovery(unittest.TestCase):

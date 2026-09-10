@@ -11,6 +11,8 @@
 
 - Local report files are archived and their aggregate IDs marked as seen only after every configured report output accepts the batch. Failed output retains source files for retry; file and mbox batches are saved before mailbox ingestion to prevent an unsaved file from suppressing a mailbox copy.
 
+- Aggregate parsing no longer replaces absent or empty envelope senders with an SPF result domain. An omitted `envelope_from` is represented by `None`, an explicitly empty element by `""` for a null reverse-path, and a reported nonempty sender is preserved. SPF results remain available separately.
+
 - Aggregate records now validate the canonical `identifiers` element and reject ambiguous, malformed or conflicting legacy `identities` data. A single nonempty `header_from` is required; duplicate values no longer become a fabricated empty domain. Unambiguous legacy reports remain supported with a warning.
 
 - Aggregate ingestion now deduplicates by reporting organization, contact email, policy domain and the full Report-ID. IDs retain their `@` suffix and surrounding angle brackets in parsed output; the optional brackets are normalized only for duplicate comparison. Distinct customer reports and full IDs no longer collide in CLI, mailbox or mbox ingestion. Malformed organization, contact-email and policy-domain shapes are rejected during parsing before they can abort ingestion during duplicate comparison.

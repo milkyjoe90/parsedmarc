@@ -58,6 +58,7 @@ class AggregateAlignment(TypedDict):
 
 class AggregateIdentifiers(TypedDict):
     header_from: str
+    # None means omitted; an empty string means a reported null reverse-path.
     envelope_from: str | None
     envelope_to: str | None
 
