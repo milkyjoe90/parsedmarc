@@ -3351,14 +3351,18 @@ This is not a DMARC report."""
         self.assertIn("Failure", str(ctx.exception))
 
     def testAttachmentMalformedXmlRaises(self):
-        """A base64 attachment of malformed aggregate XML is rejected"""
+        """RFC 9990 Appendix A requires report metadata and policy fields.
+
+        InvalidAggregateReport must survive MIME error context wrapping so
+        mbox callers can isolate the malformed message.
+        """
         att = base64.b64encode(b"<feedback></feedback>").decode()
         eml = (
             "From: a@b.c\nSubject: Agg\nMIME-Version: 1.0\n"
             "Content-Type: application/octet-stream\n"
             "Content-Transfer-Encoding: base64\n\n" + att + "\n"
         )
-        with self.assertRaises(parsedmarc.ParserError) as ctx:
+        with self.assertRaises(parsedmarc.InvalidAggregateReport) as ctx:
             parsedmarc.parse_report_email(eml, offline=True)
         self.assertIn("not a valid DMARC report", str(ctx.exception))
 
@@ -3732,6 +3736,98 @@ class TestGetDmarcReportsFromMboxParallel(unittest.TestCase):
         finally:
             box.unlock()
         box.close()
+
+    def testMalformedAggregateDoesNotAbortBatch(self):
+        """RFC 9990 §3.1.1: discard malformed reports, not unrelated reports.
+
+        Exercise real MIME parsing and multiprocessing with valid reports
+        before and after aggregates missing schema fields or carrying
+        nonscalar identities (RFC 9990 sections 3.1.1.3 and 3.1.1.5).
+        """
+        from email.mime.application import MIMEApplication
+
+        path = os.path.join(self._tmp, "malformed-aggregate.mbox")
+        xml = Path("samples/aggregate/rfc9990-sample.xml").read_bytes()
+        invalid_reports = (
+            ("malformed-aggregate", b"<feedback></feedback>"),
+            (
+                "empty-domain",
+                xml.replace(b"<domain>example.com</domain>", b"<domain/>", 1),
+            ),
+            (
+                "repeated-domain",
+                xml.replace(
+                    b"<domain>example.com</domain>",
+                    b"<domain>example.com</domain><domain>other.example</domain>",
+                    1,
+                ),
+            ),
+            (
+                "repeated-email",
+                xml.replace(
+                    b"<email>report_sender@example-reporter.com</email>",
+                    b"<email>first@example.com</email><email>second@example.com</email>",
+                ),
+            ),
+            (
+                "repeated-organization",
+                xml.replace(
+                    b"<org_name>Sample Reporter</org_name>",
+                    b"<org_name>Reporter</org_name><org_name>Other Reporter</org_name>",
+                ),
+            ),
+        )
+        reports = (
+            ("before", xml.replace(b"3v98abbp8ya9n3va8yr8oa3ya", b"before")),
+            *invalid_reports,
+            ("after", xml.replace(b"3v98abbp8ya9n3va8yr8oa3ya", b"after")),
+        )
+        box = mailbox.mbox(path)
+        try:
+            for subject, data in reports:
+                message = MIMEApplication(data, "xml")
+                message["Subject"] = subject
+                box.add(message)
+            box.flush()
+        finally:
+            box.close()
+        original_bytes = Path(path).read_bytes()
+        for n_procs in (1, 2):
+            with self.subTest(n_procs=n_procs):
+                parsedmarc.SEEN_AGGREGATE_REPORT_IDS.clear()
+                with self.assertLogs("parsedmarc.log", level="WARNING") as logs:
+                    results = parsedmarc.get_dmarc_reports_from_mbox(
+                        path, offline=True, n_procs=n_procs
+                    )
+                self.assertEqual(
+                    self._aggregate_report_ids(results), {"before", "after"}
+                )
+                self.assertEqual(len(results["aggregate_reports"]), 2)
+                for subject, _ in invalid_reports:
+                    self.assertTrue(
+                        any(subject in line for line in logs.output), logs.output
+                    )
+                self.assertEqual(Path(path).read_bytes(), original_bytes)
+
+    def testMboxReadFailureStillPropagates(self):
+        """ParserError identifies operational failure in the parser contract.
+
+        Only invalid reports are isolated; a storage read failure at the
+        standard library mailbox boundary must stop both execution modes.
+        """
+        for n_procs in (1, 2):
+            with self.subTest(n_procs=n_procs):
+                with patch.object(
+                    mailbox.mbox,
+                    "get_string",
+                    side_effect=parsedmarc.ParserError("mailbox read unavailable"),
+                ):
+                    with self.assertRaisesRegex(
+                        parsedmarc.ParserError, "mailbox read unavailable"
+                    ):
+                        parsedmarc.get_dmarc_reports_from_mbox(
+                            self._path, offline=True, n_procs=n_procs
+                        )
 
     @staticmethod
     def _aggregate_report_ids(results):

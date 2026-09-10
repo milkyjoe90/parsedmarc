@@ -2361,7 +2361,10 @@ def parse_report_email(
                 error = (
                     f'Message with subject "{subject}" is not a valid DMARC report: {e}'
                 )
-                raise ParserError(error) from e
+                # Preserve InvalidAggregateReport/InvalidFailureReport so
+                # mailbox callers can isolate bad input without confusing
+                # it with an infrastructure failure.
+                raise type(e)(error) from e
 
             except InvalidSMTPTLSReport as e:
                 # TLS attachments retain their public invalid-input subtype

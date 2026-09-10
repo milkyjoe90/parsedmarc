@@ -23,6 +23,8 @@
 
 - Reject an aggregate report when any record cannot be parsed or no records survive, instead of silently returning partial counts or an empty successful result. Record failures identify the one-based row number; mailbox ingestion routes these reports to Invalid.
 
+- **Malformed aggregate email attachments no longer abort an mbox import.** MIME parsing preserves the invalid-report exception subtype, allowing sequential and parallel imports to warn about the failed message and return the other reports. Operational parser errors continue to propagate.
+
 - **Aggregate and SMTP TLS attachments now honor their MIME transfer encoding.** Raw XML and quoted-printable attachments parse alongside Base64, including legal comments and folding in transfer headers, and compressed attachment bytes survive binary email input. Legacy attachments with undeclared Base64 remain supported. Malformed TLS attachments retain their specific invalid-report exception type.
 
 - **Failure report discovery no longer enters the original message sample.** XML attachments, SMTP TLS reports, and nested messages inside the sample cannot replace or invalidate the enclosing failure report or substitute a different sample.
