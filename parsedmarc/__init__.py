@@ -89,14 +89,9 @@ logger.debug(f"parsedmarc v{__version__}")
 xml_header_regex = re.compile(r"^<\?xml .*?>", re.MULTILINE)
 xml_schema_regex = re.compile(r"</??xs:schema.*>", re.MULTILINE)
 text_report_regex = re.compile(r"\s*([a-zA-Z\s]+):\s(.+)", re.MULTILINE)
-# Captures the value of any xmlns (default or prefixed) declaration so the
-# RFC 9990 namespace can be detected before xmltodict drops it.
-xml_namespace_regex = re.compile(
-    r"""xmlns(?::[a-zA-Z_][\w.-]*)?\s*=\s*["']([^"']+)["']"""
-)
-
 # The XML namespace assigned to DMARC aggregate reports by RFC 9990.
 RFC_9990_NAMESPACE = "urn:ietf:params:xml:ns:dmarc-2.0"
+_RFC_7489_NAMESPACE = "http://dmarc.org/dmarc-xml/0.1"
 
 # Implementation safety limits, not RFC validity requirements. Reports are
 # normally daily; a full leap year accommodates delayed/batched reporters.
@@ -958,6 +953,42 @@ def _validate_aggregate_record_budget(
     return raw_records, normalize_timespan
 
 
+def _parse_aggregate_xml_document(xml: str) -> tuple[dict[str, Any], str | None]:
+    """Resolve XML names without conflating extension and DMARC elements.
+
+    W3C Namespaces in XML section 2 identifies an element by namespace URI
+    and local name, irrespective of its chosen prefix. Only the namespaces
+    from RFC 7489 Appendix C and RFC 9990 Appendix A are collapsed here;
+    namespace-less reports retain their long-standing compatibility path.
+    """
+    xml_namespace: str | None = None
+
+    def normalize_name(
+        path: list[tuple[str, Any]], key: str, value: Any
+    ) -> tuple[str, Any]:
+        nonlocal xml_namespace
+        # Namespace declarations identify names rather than decorate values.
+        # Remove xmltodict's declaration bookkeeping while retaining actual
+        # attributes. A scalar with only declarations becomes scalar again.
+        if isinstance(value, dict) and "@xmlns" in value:
+            value.pop("@xmlns")
+            if not value:
+                value = None
+            elif set(value) == {"#text"}:
+                value = value["#text"]
+        namespace, _, local_name = key.rpartition(":")
+        if len(path) == 1 and key == path[0][0]:
+            xml_namespace = namespace or None
+        if namespace in (_RFC_7489_NAMESPACE, RFC_9990_NAMESPACE):
+            key = local_name
+        return key, value
+
+    document = xmltodict.parse(
+        xml, process_namespaces=True, postprocessor=normalize_name
+    )
+    return document["feedback"], xml_namespace
+
+
 def _aggregate_key_text(
     value: Any, field_name: str, *, allow_empty: bool = False
 ) -> str | None:
@@ -1040,22 +1071,8 @@ def parse_aggregate_report_xml(
     if isinstance(xml, bytes):
         xml = xml.decode(errors="ignore")
 
-    # Detect the XML namespace before any rewriting strips it. The dmarc-2.0
-    # namespace is one of the indicators for an RFC 9990 report but it is
-    # NOT a reliable sole discriminator: the <version> element value is
-    # ambiguous (RFC 9990's appendix sample uses <version>1.0</version>
-    # inside the dmarc-2.0 namespace), and real-world reporters frequently
-    # emit RFC 9990-shaped reports without declaring the namespace at all.
-    # The final `is_rfc_9990` decision is made post-parse so that
-    # RFC 9990-only fields (np, testing, discovery_method, generator,
-    # human_result) can also vote it in.
-    xml_namespace: str | None = None
-    namespace_match = xml_namespace_regex.search(xml)
-    if namespace_match:
-        xml_namespace = namespace_match.group(1)
-
     try:
-        xmltodict.parse(xml)["feedback"]
+        _parse_aggregate_xml_document(xml)
     except Exception as e:
         errors.append(f"Invalid XML: {e.__str__()}")
         try:
@@ -1075,7 +1092,7 @@ def parse_aggregate_report_xml(
         # Remove invalid schema tags
         xml = xml_schema_regex.sub("", xml)
 
-        report = xmltodict.parse(xml)["feedback"]
+        report, xml_namespace = _parse_aggregate_xml_document(xml)
         report_metadata = report["report_metadata"]
         # <email> is xs:string in both RFC 7489 and RFC 9990, but defensive
         # parsing in the wild: some reporters emit it with an xml:lang or
@@ -1156,7 +1173,7 @@ def parse_aggregate_report_xml(
             raw_errors = report["report_metadata"]["error"]
             if not isinstance(raw_errors, list):
                 raw_errors = [raw_errors]
-            errors = [text for text in (_text(e) for e in raw_errors) if text]
+            errors.extend(text for text in (_text(e) for e in raw_errors) if text)
         new_report_metadata["errors"] = errors
         # <generator> is a plain xs:string in RFC 9990 but apply _text() so
         # a malformed reporter that decorates it with attributes still

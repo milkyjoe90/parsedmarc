@@ -5939,6 +5939,177 @@ def _minimal_aggregate_xml(
     </feedback>"""
 
 
+class TestAggregateXmlNamespaces(unittest.TestCase):
+    """W3C Namespaces in XML 2: expanded names are URI/local-name pairs.
+
+    https://www.w3.org/TR/xml-names/#ns-decl
+    RFC 7489 Appendix C and RFC 9990 Appendix A define the recognized URIs.
+    """
+
+    def _namespaced(self, namespace, prefix):
+        root = etree.fromstring(_minimal_aggregate_xml().encode("utf-8"))
+        qualified = etree.Element(f"{{{namespace}}}feedback", nsmap={prefix: namespace})
+        for child in root:
+            for element in child.iter():
+                element.tag = f"{{{namespace}}}{element.tag}"
+            qualified.append(child)
+        return etree.tostring(qualified).decode("utf-8")
+
+    def testDefaultAndPrefixedDmarcNamespacesAreEquivalent(self):
+        """W3C XML Namespaces 2: namespace prefixes cannot change meaning."""
+        for namespace in (
+            "http://dmarc.org/dmarc-xml/0.1",
+            "urn:ietf:params:xml:ns:dmarc-2.0",
+        ):
+            with self.subTest(namespace=namespace):
+                default = parsedmarc.parse_aggregate_report_xml(
+                    self._namespaced(namespace, None), offline=True
+                )
+                prefixed = parsedmarc.parse_aggregate_report_xml(
+                    self._namespaced(namespace, "d"), offline=True
+                )
+                self.assertEqual(prefixed, default)
+                self.assertEqual(prefixed["xml_namespace"], namespace)
+                self.assertEqual(prefixed["policy_published"]["domain"], "example.com")
+                self.assertEqual(prefixed["records"][0]["count"], 1)
+                self.assertEqual(prefixed["report_metadata"]["errors"], [])
+
+    def testLocalNamespaceDeclarationsDoNotChangeScalarValues(self):
+        """W3C XML Namespaces 6.1: declaration scope does not alter values.
+
+        https://www.w3.org/TR/xml-names/#scoping
+        Redundant default declarations and unused prefix declarations on a
+        scalar element must not turn its content into a structured value.
+        """
+        namespace = "urn:ietf:params:xml:ns:dmarc-2.0"
+        xml = self._namespaced(namespace, None)
+        expected = parsedmarc.parse_aggregate_report_xml(xml, offline=True)
+        for declaration in (
+            f'xmlns="{namespace}"',
+            'xmlns:ext="urn:example:extension"',
+        ):
+            for element in ("count", "begin", "email", "report_id", "domain"):
+                with self.subTest(declaration=declaration, element=element):
+                    with_declaration = xml.replace(
+                        f"<{element}>", f"<{element} {declaration}>"
+                    )
+                    actual = parsedmarc.parse_aggregate_report_xml(
+                        with_declaration, offline=True
+                    )
+                    self.assertEqual(actual, expected)
+
+    def testLocalDeclarationsPreserveEmptyValuesAndSemanticAttributes(self):
+        """W3C XML Namespaces 6.1 scopes declarations independently of values.
+
+        https://www.w3.org/TR/xml-names/#scoping
+        """
+        xml = (
+            self._namespaced("urn:ietf:params:xml:ns:dmarc-2.0", None)
+            .replace("<org_name>TestOrg</org_name>", "<org_name/>")
+            .replace(
+                "</report_metadata>",
+                '<extra_contact_info lang="en">contact</extra_contact_info><error/></report_metadata>',
+            )
+        )
+        expected = parsedmarc.parse_aggregate_report_xml(xml, offline=True)
+        decorated = (
+            xml.replace(
+                '<extra_contact_info lang="en">',
+                '<extra_contact_info xmlns:ext="urn:example:extension" lang="en">',
+            )
+            .replace("<error/>", '<error xmlns:ext="urn:example:extension"/>')
+            .replace("<org_name/>", '<org_name xmlns:ext="urn:example:extension"/>')
+        )
+        document, _ = parsedmarc._parse_aggregate_xml_document(decorated)
+        self.assertEqual(
+            document["report_metadata"]["extra_contact_info"],
+            {"@lang": "en", "#text": "contact"},
+        )
+        self.assertIsNone(document["report_metadata"]["error"])
+        actual = parsedmarc.parse_aggregate_report_xml(decorated, offline=True)
+        self.assertEqual(actual["report_metadata"]["org_name"], "example.com")
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual["report_metadata"]["org_extra_contact_info"], "contact")
+        self.assertEqual(actual["report_metadata"]["errors"], [])
+
+    def testExtensionDeclarationCannotMaskRootNamespace(self):
+        """RFC 9990 3.1.1.1: the root's namespace determines its identity.
+
+        https://www.rfc-editor.org/rfc/rfc9990.html#section-3.1.1.1
+        An unrelated declaration must not suppress RFC 9990-aware warnings.
+        """
+        xml = _minimal_aggregate_xml(
+            reason="<reason><type>forwarded</type></reason>"
+        ).replace(
+            "<feedback>",
+            '<feedback xmlns:ext="urn:example:extension" xmlns="urn:ietf:params:xml:ns:dmarc-2.0">',
+        )
+        with self.assertLogs("parsedmarc.log", level="WARNING") as logs:
+            report = parsedmarc.parse_aggregate_report_xml(xml, offline=True)
+        self.assertEqual(report["xml_namespace"], "urn:ietf:params:xml:ns:dmarc-2.0")
+        self.assertTrue(any("removed in RFC 9990" in log for log in logs.output))
+
+    def testExtensionElementsCannotReplaceDmarcData(self):
+        """RFC 9990 5: unknown extensions are ignored, not core DMARC data.
+
+        https://www.rfc-editor.org/rfc/rfc9990.html#section-5
+        """
+        xml = (
+            _minimal_aggregate_xml()
+            .replace("<feedback>", '<feedback xmlns:ext="urn:example:extension">')
+            .replace(
+                "</policy_published>",
+                "<ext:domain>attacker.example</ext:domain></policy_published>",
+            )
+            .replace("<count>1</count>", "<count>1</count><ext:count>9000</ext:count>")
+            .replace(
+                "</feedback>",
+                "<ext:record><ext:row><ext:count>9000</ext:count></ext:row></ext:record></feedback>",
+            )
+        )
+        report = parsedmarc.parse_aggregate_report_xml(xml, offline=True)
+        self.assertIsNone(report["xml_namespace"])
+        self.assertEqual(report["policy_published"]["domain"], "example.com")
+        self.assertEqual([row["count"] for row in report["records"]], [1])
+        with self.assertRaises(parsedmarc.InvalidAggregateReport):
+            parsedmarc.parse_aggregate_report_xml(
+                xml.replace("<count>1</count>", ""), offline=True
+            )
+
+    def testUnknownRootNamespaceIsRejected(self):
+        """W3C XML Namespaces 2: another URI is not a DMARC root element."""
+        for prefix in (None, "d"):
+            with self.subTest(prefix=prefix):
+                with self.assertRaises(parsedmarc.InvalidAggregateReport):
+                    parsedmarc.parse_aggregate_report_xml(
+                        self._namespaced("urn:example:unrelated", prefix), offline=True
+                    )
+
+    def testRecoveredXmlPreservesNamespaceAndAllErrors(self):
+        """RFC 9990 3.1.5's reporter error must not hide XML recovery.
+
+        https://www.rfc-editor.org/rfc/rfc9990.html#section-3.1.5
+        """
+        xml = (
+            self._namespaced("urn:ietf:params:xml:ns:dmarc-2.0", "d")
+            .replace(
+                "</d:report_metadata>",
+                '<d:error lang="en">reporter diagnostic</d:error></d:report_metadata>',
+            )
+            .replace("</d:feedback>", "<broken_tag</d:feedback>")
+        )
+        report = parsedmarc.parse_aggregate_report_xml(xml, offline=True)
+        self.assertEqual(report["xml_namespace"], "urn:ietf:params:xml:ns:dmarc-2.0")
+        self.assertEqual(report["records"][0]["count"], 1)
+        self.assertIn("reporter diagnostic", report["report_metadata"]["errors"])
+        self.assertTrue(
+            any(
+                error.startswith("Invalid XML:")
+                for error in report["report_metadata"]["errors"]
+            )
+        )
+
+
 class TestAggregateNormalizationLimits(unittest.TestCase):
     """Implementation limits against the report-content attacks in RFC 9990 8.1.
 
