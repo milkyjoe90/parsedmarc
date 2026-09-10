@@ -877,6 +877,25 @@ def parsed_smtp_tls_reports_to_csv(
     return csv_file_object.getvalue()
 
 
+def _aggregate_key_text(
+    value: Any, field_name: str, *, allow_empty: bool = False
+) -> str | None:
+    """Validate a scalar identity before using it in a report dedup key.
+
+    RFC 9990 sections 3.1.1.3 and 3.1.1.5 require scalar metadata and domain
+    fields. allow_empty permits None and empty strings for legacy contacts
+    and org-name fallback; otherwise, the value must contain nonempty text.
+    """
+    if allow_empty and value is None:
+        return None
+    if not isinstance(value, str) or (not allow_empty and not value.strip()):
+        qualifier = "a single" if allow_empty else "one nonempty"
+        raise InvalidAggregateReport(
+            f"{field_name} must contain {qualifier} text value"
+        )
+    return value
+
+
 def parse_aggregate_report_xml(
     xml: str | bytes,
     *,
@@ -983,6 +1002,9 @@ def parse_aggregate_report_xml(
                     report_metadata["email"],
                 )
             report_metadata["email"] = unwrapped
+        org_email = _aggregate_key_text(
+            report_metadata["email"], "Report metadata email", allow_empty=True
+        )
         schema = "draft"
         if "version" in report:
             schema = report["version"]
@@ -994,7 +1016,9 @@ def parse_aggregate_report_xml(
         if report_metadata["org_name"] is None:
             if report_metadata["email"] is not None:
                 report_metadata["org_name"] = report_metadata["email"].split("@")[-1]
-        org_name = report_metadata["org_name"]
+        org_name = _aggregate_key_text(
+            report_metadata["org_name"], "Organization name", allow_empty=True
+        )
         if org_name is not None and " " not in org_name:
             new_org_name = get_base_domain(org_name)
             if new_org_name is not None:
@@ -1006,14 +1030,16 @@ def parse_aggregate_report_xml(
                 "for saving the report"
             )
         new_report_metadata["org_name"] = org_name
-        new_report_metadata["org_email"] = report_metadata["email"]
+        new_report_metadata["org_email"] = org_email
         # extra_contact_info is langAttrString in RFC 9990 (xs:string in
         # RFC 7489) — unwrap {"#text": ..., "@lang": ...} if present.
         extra = _text(report_metadata.get("extra_contact_info"))
         new_report_metadata["org_extra_contact_info"] = extra
-        new_report_metadata["report_id"] = report_metadata["report_id"]
-        report_id = new_report_metadata["report_id"]
-        report_id = report_id.replace("<", "").replace(">", "").split("@")[0]
+        report_id = report_metadata["report_id"]
+        if not isinstance(report_id, str) or not report_id.strip():
+            raise InvalidAggregateReport(
+                "Report-ID must contain one nonempty text value"
+            )
         new_report_metadata["report_id"] = report_id
         date_range = report["report_metadata"]["date_range"]
 
@@ -1072,7 +1098,9 @@ def parse_aggregate_report_xml(
             or any(f in policy_published for f in rfc_9990_only_policy_fields)
         )
         new_policy_published: dict[str, Any] = {}
-        new_policy_published["domain"] = policy_published["domain"]
+        new_policy_published["domain"] = _aggregate_key_text(
+            policy_published["domain"], "Policy domain"
+        )
         adkim = "r"
         if "adkim" in policy_published:
             if policy_published["adkim"] is not None:
@@ -2379,6 +2407,25 @@ def parse_report_file(
     return results
 
 
+def _aggregate_report_key(report: AggregateReport) -> tuple[str, str, str, str]:
+    """Scope a full Report-ID to its reporting organization and policy domain.
+
+    RFC 9990 section 3.5.1 permits an optional surrounding pair of angle
+    brackets and an @ suffix. Normalize only that syntactic wrapper for
+    deduplication; the parsed metadata retains the reporter's full value.
+    """
+    metadata = report["report_metadata"]
+    report_id = metadata["report_id"]
+    if report_id.startswith("<") and report_id.endswith(">"):
+        report_id = report_id[1:-1]
+    return (
+        metadata["org_name"],
+        metadata["org_email"],
+        report["policy_published"]["domain"].lower(),
+        report_id,
+    )
+
+
 def _classify_parsed_email(
     parsed_email: ParsedReport,
     aggregate_reports: list[AggregateReport],
@@ -2386,15 +2433,16 @@ def _classify_parsed_email(
     smtp_tls_reports: list[SMTPTLSReport],
     *,
     seen_aggregate_report_ids: ExpiringDict,
-    pending_aggregate_keys: set[str] | None = None,
+    pending_aggregate_keys: set[tuple[str, str, str, str]] | None = None,
 ) -> ReportType:
     """Classify a parsed report email, appending it to the matching list.
 
     Owns the seen-aggregate-report-ID dedup check against
     ``seen_aggregate_report_ids``: an aggregate report already seen (keyed
-    on ``{org_name}_{report_id}``) is logged and dropped instead of
-    appended. Shared, unmodified, by the sequential and parallel branches
-    of ``get_dmarc_reports_from_mbox`` and ``get_dmarc_reports_from_mailbox``
+    by reporting organization, contact email, policy domain and full Report-ID)
+    is logged and dropped instead of appended. Shared by the sequential and
+    parallel branches of ``get_dmarc_reports_from_mbox`` and
+    ``get_dmarc_reports_from_mailbox``
     so both dedup identically -- callers pass the config's
     ``seen_aggregate_report_ids`` cache so dedup state stays scoped to
     whichever ``ParserConfig`` (explicit or module-default) is in effect.
@@ -2418,7 +2466,7 @@ def _classify_parsed_email(
     if parsed_email["report_type"] == "aggregate":
         report_org = parsed_email["report"]["report_metadata"]["org_name"]
         report_id = parsed_email["report"]["report_metadata"]["report_id"]
-        report_key = f"{report_org}_{report_id}"
+        report_key = _aggregate_report_key(parsed_email["report"])
         already_seen = report_key in seen_aggregate_report_ids or (
             pending_aggregate_keys is not None and report_key in pending_aggregate_keys
         )
@@ -2869,7 +2917,7 @@ def get_dmarc_reports_from_mailbox(
     # cache once the batch is known to be saved, so an unsaved batch (or a
     # mid-batch crash) leaves the cache clean and the reports are reparsed
     # on the retry instead of being dropped as duplicates.
-    pending_aggregate_keys: set[str] = set()
+    pending_aggregate_keys: set[tuple[str, str, str, str]] = set()
     aggregate_report_msg_uids = []
     failure_report_msg_uids = []
     smtp_tls_msg_uids = []

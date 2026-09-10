@@ -1511,6 +1511,63 @@ class TestArchiveDirectory(unittest.TestCase):
             self.assertFalse(os.path.isfile(copy1))
             self.assertFalse(os.path.isfile(copy2))
 
+    def test_distinct_domains_reporters_and_full_ids_survive_cli_dedup(self):
+        """RFC 9990 section 3.5.1: IDs are scoped to a policy domain.
+
+        https://www.rfc-editor.org/rfc/rfc9990.html#section-3.5.1
+        Verify saved JSON, including the @ suffix, and archived originals.
+        """
+        from xml.etree import ElementTree
+
+        cases = [
+            ("alpha.example", "7@east.example", "reports@east.example"),
+            ("beta.example", "7@east.example", "reports@east.example"),
+            ("alpha.example", "7@west.example", "reports@east.example"),
+            ("alpha.example", "7@east.example", "reports@west.example"),
+        ]
+        for n_procs in (1, 2):
+            with self.subTest(n_procs=n_procs), tempfile.TemporaryDirectory() as tmp:
+                parsedmarc.SEEN_AGGREGATE_REPORT_IDS.clear()
+                input_dir = os.path.join(tmp, "input")
+                os.makedirs(input_dir)
+                for index, (domain, report_id, contact) in enumerate(
+                    cases + [cases[0]]
+                ):
+                    tree = ElementTree.parse(self.AGGREGATE_SAMPLE_1)
+                    for tag, value in (
+                        ("report_metadata/org_name", "Reporter"),
+                        ("report_metadata/report_id", report_id),
+                        ("report_metadata/email", contact),
+                        ("policy_published/domain", domain),
+                    ):
+                        element = tree.find(tag)
+                        assert element is not None
+                        element.text = value
+                    tree.write(os.path.join(input_dir, f"report-{index}.xml"))
+                cfg, output_dir, archive = self._write_config(
+                    tmp, "output", archive_dirname="archive", n_procs=n_procs
+                )
+                assert archive is not None
+                with patch.object(sys, "argv", ["parsedmarc", "-c", cfg, input_dir]):
+                    parsedmarc.cli._main()
+                with open(os.path.join(output_dir, "aggregate.json")) as handle:
+                    reports = json.load(handle)
+                self.assertEqual(len(reports), len(cases))
+                self.assertEqual(
+                    {
+                        (
+                            r["policy_published"]["domain"],
+                            r["report_metadata"]["report_id"],
+                            r["report_metadata"]["org_email"],
+                        )
+                        for r in reports
+                    },
+                    set(cases),
+                )
+                self.assertEqual(os.listdir(input_dir), [])
+                archived = [name for _, _, names in os.walk(archive) for name in names]
+                self.assertEqual(len(archived), len(cases) + 1)
+
 
 class TestGmailAuthModes(unittest.TestCase):
     @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")

@@ -31,6 +31,7 @@ from parsedmarc import (
     ParserConfig,
     ParserError,
     __version__,
+    _aggregate_report_key,
     email_results,
     email_results_via_msgraph,
     get_dmarc_reports_from_mailbox,
@@ -2976,7 +2977,7 @@ def _main():
             if result["report_type"] == "aggregate":
                 report_org = result["report"]["report_metadata"]["org_name"]
                 report_id = result["report"]["report_metadata"]["report_id"]
-                report_key = f"{report_org}_{report_id}"
+                report_key = _aggregate_report_key(result["report"])
                 if report_key not in SEEN_AGGREGATE_REPORT_IDS:
                     SEEN_AGGREGATE_REPORT_IDS[report_key] = True
                     aggregate_reports.append(result["report"])

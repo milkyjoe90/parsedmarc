@@ -3326,6 +3326,278 @@ class TestGetDmarcReportsFromMboxParallel(unittest.TestCase):
         )
 
 
+class TestAggregateDeduplication(unittest.TestCase):
+    """RFC 9990 section 3.5.1 scopes Report-IDs to a domain.
+
+    https://www.rfc-editor.org/rfc/rfc9990.html#section-3.5.1
+    """
+
+    CASES = [
+        ("Reporter", "reports@east.example", "alpha.example", "7@east.example"),
+        ("Reporter", "reports@east.example", "beta.example", "7@east.example"),
+        ("Reporter", "reports@east.example", "alpha.example", "7@west.example"),
+        ("Reporter", "reports@west.example", "alpha.example", "7@east.example"),
+        ("Reporter_a", "reports@east.example", "alpha.example", "b"),
+        ("Reporter", "reports@east.example", "alpha.example", "a_b"),
+    ]
+
+    def setUp(self):
+        self.tmp = mkdtemp()
+        self.addCleanup(rmtree, self.tmp, ignore_errors=True)
+
+    @staticmethod
+    def _xml(org, contact, domain, report_id):
+        root = etree.fromstring(
+            Path("samples/aggregate/rfc9990-sample.xml").read_bytes()
+        )
+        # The sample uses a default namespace; local-name XPath also works
+        # with the parser's current namespace handling.
+        for name, value in (
+            ("org_name", org),
+            ("email", contact),
+            ("report_id", report_id),
+        ):
+            root.xpath(f"//*[local-name()='{name}']")[0].text = value
+        root.xpath("//*[local-name()='policy_published']/*[local-name()='domain']")[
+            0
+        ].text = domain
+        return etree.tostring(root)
+
+    def _messages(self):
+        from email.mime.application import MIMEApplication
+
+        cases = self.CASES + [self.CASES[0], (*self.CASES[0][:3], "<7@east.example>")]
+        messages = []
+        for case in cases:
+            message = MIMEMultipart()
+            message["From"] = "reports@east.example"
+            message["Date"] = "Thu, 10 Sep 2026 00:00:00 +0000"
+            attachment = MIMEApplication(self._xml(*case), "xml")
+            attachment.add_header(
+                "Content-Disposition", "attachment", filename="report.xml"
+            )
+            message.attach(attachment)
+            messages.append(message)
+        return messages
+
+    def _assert_reports(self, reports):
+        identities = {
+            (
+                r["report_metadata"]["org_name"],
+                r["report_metadata"]["org_email"],
+                r["policy_published"]["domain"],
+                r["report_metadata"]["report_id"].strip("<>"),
+            )
+            for r in reports
+        }
+        self.assertEqual(identities, set(self.CASES))
+        self.assertEqual(len(reports), len(self.CASES))
+        self.assertTrue(all(report["records"] for report in reports))
+
+    def test_parser_preserves_full_report_id(self):
+        """RFC 9990 section 3.5.1 allows @ and optional surrounding <>."""
+        for report_id in ("7@east.example", "<7@east.example>"):
+            with self.subTest(report_id=report_id):
+                xml = self._xml(*self.CASES[0][:3], report_id)
+                report = parsedmarc.parse_aggregate_report_xml(xml, offline=True)
+                self.assertEqual(report["report_metadata"]["report_id"], report_id)
+                self.assertEqual(
+                    parsedmarc.parsed_aggregate_reports_to_csv_rows(report)[0][
+                        "report_id"
+                    ],
+                    report_id,
+                )
+
+    def test_malformed_report_id_is_rejected_before_deduplication(self):
+        """RFC 9990 section 3.5.1 requires a single nonempty Report-ID."""
+        xml = self._xml(*self.CASES[0])
+        for replacement in (
+            b"",
+            b"<report_id/>",
+            b"<report_id>a</report_id><report_id>b</report_id>",
+        ):
+            with self.subTest(replacement=replacement):
+                malformed = xml.replace(
+                    b"<report_id>7@east.example</report_id>", replacement
+                )
+                with self.assertRaises(parsedmarc.InvalidAggregateReport):
+                    parsedmarc.parse_aggregate_report_xml(malformed, offline=True)
+
+    def _malformed_key_reports(self):
+        xml = self._xml(*self.CASES[0])
+        cases = (
+            ("empty-domain", b"<domain>alpha.example</domain>", b"<domain/>"),
+            ("missing-domain", b"<domain>alpha.example</domain>", b""),
+            (
+                "whitespace-domain",
+                b"<domain>alpha.example</domain>",
+                b"<domain> </domain>",
+            ),
+            (
+                "repeated-domain",
+                b"<domain>alpha.example</domain>",
+                b"<domain>alpha.example</domain><domain>beta.example</domain>",
+            ),
+            (
+                "nested-domain",
+                b"<domain>alpha.example</domain>",
+                b"<domain><name>alpha.example</name></domain>",
+            ),
+            (
+                "repeated-email",
+                b"<email>reports@east.example</email>",
+                b"<email>reports@east.example</email><email>reports@west.example</email>",
+            ),
+            (
+                "repeated-organization",
+                b"<org_name>Reporter</org_name>",
+                b"<org_name>Reporter</org_name><org_name>Other Reporter</org_name>",
+            ),
+            (
+                "nested-organization",
+                b"<org_name>Reporter</org_name>",
+                b"<org_name><name>Reporter</name></org_name>",
+            ),
+        )
+        return [
+            (name, xml.replace(original, replacement))
+            for name, original, replacement in cases
+        ]
+
+    def test_malformed_deduplication_fields_are_rejected_during_parsing(self):
+        """RFC 9990 sections 3.1.1.3 and 3.1.1.5 require scalar key fields.
+
+        https://www.rfc-editor.org/rfc/rfc9990.html#section-3.1.1.3
+        https://www.rfc-editor.org/rfc/rfc9990.html#section-3.1.1.5
+        Reject invalid shapes before ingestion hashes or normalizes them.
+        """
+        for name, xml in self._malformed_key_reports():
+            with self.subTest(name=name):
+                with self.assertRaises(parsedmarc.InvalidAggregateReport):
+                    parsedmarc.parse_aggregate_report_xml(xml, offline=True)
+
+    def test_mailbox_quarantines_invalid_keys_and_retains_unsaved_reports(self):
+        """RFC 9990 section 3.1.1: discard invalid reports individually.
+
+        Invalid key fields must reach the real mailbox quarantine path,
+        while the save_callback contract retains valid unsaved originals.
+        """
+        from email.mime.application import MIMEApplication
+
+        malformed = self._malformed_key_reports()
+        for n_procs in (1, 2):
+            with self.subTest(n_procs=n_procs):
+                path = os.path.join(self.tmp, f"invalid-keys-{n_procs}")
+                box = mailbox.Maildir(path, create=True)
+                valid = self._xml(*self.CASES[0])
+                # A discarded attribute-only email remains a supported None
+                # contact, and must also work in the structured dedup key.
+                no_contact = valid.replace(b"7@east.example", b"no-contact").replace(
+                    b"<email>reports@east.example</email>", b'<email xml:lang="en"/>'
+                )
+                for name, xml in [
+                    ("valid", valid),
+                    *malformed,
+                    ("no-contact", no_contact),
+                ]:
+                    message = MIMEApplication(xml, "xml")
+                    message["Subject"] = name
+                    box.add(message)
+                box.flush()
+                box.close()
+                conn = MaildirConnection(path, maildir_create=True)
+                cfg = parsedmarc.ParserConfig(offline=True)
+                failed = parsedmarc.get_dmarc_reports_from_mailbox(
+                    conn, config=cfg, n_procs=n_procs, save_callback=lambda batch: False
+                )
+                self.assertEqual(
+                    {
+                        report["report_metadata"]["report_id"]
+                        for report in failed["aggregate_reports"]
+                    },
+                    {"7@east.example", "no-contact"},
+                )
+                self.assertEqual(len(failed["aggregate_reports"]), 2)
+                self.assertEqual(len(conn.fetch_messages("INBOX")), 2)
+                self.assertEqual(
+                    len(conn.fetch_messages("Archive/Invalid")), len(malformed)
+                )
+                self.assertEqual(len(cfg.seen_aggregate_report_ids), 0)
+                saved = []
+                parsedmarc.get_dmarc_reports_from_mailbox(
+                    conn, config=cfg, n_procs=n_procs, save_callback=saved.append
+                )
+                self.assertEqual(len(saved), 1)
+                reports = saved[0]["aggregate_reports"]
+                self.assertEqual(
+                    {report["report_metadata"]["report_id"] for report in reports},
+                    {"7@east.example", "no-contact"},
+                )
+                contact = next(
+                    report
+                    for report in reports
+                    if report["report_metadata"]["report_id"] == "no-contact"
+                )
+                self.assertIsNone(contact["report_metadata"]["org_email"])
+                self.assertTrue(all(report["records"] for report in reports))
+                self.assertEqual(conn.fetch_messages("INBOX"), [])
+                self.assertEqual(len(conn.fetch_messages("Archive/Aggregate")), 2)
+                self.assertEqual(
+                    len(conn.fetch_messages("Archive/Invalid")), len(malformed)
+                )
+                self.assertEqual(len(cfg.seen_aggregate_report_ids), 2)
+
+    def test_mbox_preserves_domains_reporters_and_full_ids(self):
+        """RFC 9990 section 3.5.1: only true duplicates may be suppressed."""
+        path = os.path.join(self.tmp, "reports.mbox")
+        box = mailbox.mbox(path)
+        for message in self._messages():
+            box.add(message)
+        box.flush()
+        box.close()
+        for n_procs in (1, 2):
+            with self.subTest(n_procs=n_procs):
+                cfg = parsedmarc.ParserConfig(offline=True)
+                reports = parsedmarc.get_dmarc_reports_from_mbox(
+                    path, config=cfg, n_procs=n_procs
+                )["aggregate_reports"]
+                self._assert_reports(reports)
+                repeated = parsedmarc.get_dmarc_reports_from_mbox(path, config=cfg)
+                self.assertEqual(repeated["aggregate_reports"], [])
+
+    def test_mailbox_retry_preserves_distinct_reports_until_saved(self):
+        """RFC 9990 section 3.5.1 and the mailbox save_callback contract:
+        failed output must leave every distinct report eligible for retry.
+        """
+        for n_procs in (1, 2):
+            with self.subTest(n_procs=n_procs):
+                path = os.path.join(self.tmp, f"maildir-{n_procs}")
+                box = mailbox.Maildir(path, create=True)
+                messages = self._messages()
+                for message in messages:
+                    box.add(message)
+                box.flush()
+                box.close()
+                conn = MaildirConnection(path, maildir_create=True)
+                cfg = parsedmarc.ParserConfig(offline=True)
+                failed = parsedmarc.get_dmarc_reports_from_mailbox(
+                    conn, config=cfg, n_procs=n_procs, save_callback=lambda batch: False
+                )
+                self._assert_reports(failed["aggregate_reports"])
+                self.assertEqual(len(conn.fetch_messages("INBOX")), len(messages))
+                self.assertEqual(len(cfg.seen_aggregate_report_ids), 0)
+                saved = []
+                parsedmarc.get_dmarc_reports_from_mailbox(
+                    conn, config=cfg, n_procs=n_procs, save_callback=saved.append
+                )
+                self._assert_reports(saved[0]["aggregate_reports"])
+                self.assertEqual(conn.fetch_messages("INBOX"), [])
+                self.assertEqual(
+                    len(conn.fetch_messages("Archive/Aggregate")), len(messages)
+                )
+                self.assertEqual(len(cfg.seen_aggregate_report_ids), len(self.CASES))
+
+
 class TestCentralizedConfig(unittest.TestCase):
     """Regression coverage for the centralize-config-503 refactor
     (parsedmarc/config.py's ``ParserConfig``): the kwargs-style public API
@@ -3379,7 +3651,12 @@ class TestCentralizedConfig(unittest.TestCase):
         self.assertEqual(len(second["aggregate_reports"]), 0)
 
         report_metadata = first["aggregate_reports"][0]["report_metadata"]
-        report_key = f"{report_metadata['org_name']}_{report_metadata['report_id']}"
+        report_key = (
+            report_metadata["org_name"],
+            report_metadata["org_email"],
+            first["aggregate_reports"][0]["policy_published"]["domain"].lower(),
+            report_metadata["report_id"].removeprefix("<").removesuffix(">"),
+        )
         self.assertIn(report_key, parsedmarc.SEEN_AGGREGATE_REPORT_IDS)
 
     def test_kwargs_and_config_equivalence(self):

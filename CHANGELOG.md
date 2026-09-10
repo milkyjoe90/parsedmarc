@@ -9,6 +9,8 @@
 
 ### Bug fixes
 
+- Aggregate ingestion now deduplicates by reporting organization, contact email, policy domain and the full Report-ID. IDs retain their `@` suffix and surrounding angle brackets in parsed output; the optional brackets are normalized only for duplicate comparison. Distinct customer reports and full IDs no longer collide in CLI, mailbox or mbox ingestion. Malformed organization, contact-email and policy-domain shapes are rejected during parsing before they can abort ingestion during duplicate comparison.
+
 - `find_unknown_base_reverse_dns.py`'s missing-file checks for `base_reverse_dns_map.csv` and the `known_unknown`/PSL-override lists printed a clean error message but fell through into an unhandled `FileNotFoundError` traceback instead of exiting.
 
 ### Bug fixes
