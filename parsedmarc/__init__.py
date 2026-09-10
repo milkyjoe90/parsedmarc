@@ -9,6 +9,8 @@ import email
 import email.errors
 import email.headerregistry
 import email.message
+import email.parser
+import email.policy
 import email.utils
 import functools
 import json
@@ -84,11 +86,6 @@ from parsedmarc.utils import (
 
 logger.debug(f"parsedmarc v{__version__}")
 
-# A message/feedback-report part is a MIME body part, so its lines end with
-# CRLF per RFC 5322 §2.1. In re.MULTILINE, ``$`` matches before the LF but not
-# before the CR, so the value must exclude the line ending explicitly rather
-# than relying on ``.`` — otherwise every field value keeps a trailing CR.
-feedback_report_regex = re.compile(r"^([\w\-]+): ([^\r\n]+)\r?$", re.MULTILINE)
 xml_header_regex = re.compile(r"^<\?xml .*?>", re.MULTILINE)
 xml_schema_regex = re.compile(r"</??xs:schema.*>", re.MULTILINE)
 text_report_regex = re.compile(r"\s*([a-zA-Z\s]+):\s(.+)", re.MULTILINE)
@@ -1707,6 +1704,40 @@ def parsed_aggregate_reports_to_csv(
     return csv_file_object.getvalue()
 
 
+def _parse_failure_mechanism_list(value: str, field_name: str) -> list[str]:
+    """Remove RFC 5322 §3.2.2 CFWS before splitting mechanism names.
+
+    Comments may nest and contain escaped parentheses, backslashes, or
+    commas. Quoted mechanism names are not in the RFC 9991 §4 grammar.
+    """
+    uncommented: list[str] = []
+    depth = 0
+    escaped = False
+    for char in value:
+        if depth:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+        elif char == "(":
+            depth = 1
+            uncommented.append(" ")
+        elif char in (")", '"', "\\"):
+            raise InvalidFailureReport(f"Invalid {field_name} mechanism syntax")
+        else:
+            uncommented.append(char)
+    if depth:
+        raise InvalidFailureReport(f"Unclosed comment in {field_name}")
+    mechanisms = [token.strip() for token in "".join(uncommented).split(",")]
+    if any(any(char.isspace() for char in token) for token in mechanisms):
+        raise InvalidFailureReport(f"Invalid {field_name} mechanism syntax")
+    return [token for token in mechanisms if token]
+
+
 def parse_failure_report(
     feedback_report: str,
     sample: str,
@@ -1767,10 +1798,14 @@ def parse_failure_report(
 
     try:
         parsed_report: dict[str, Any] = {}
-        report_values = feedback_report_regex.findall(feedback_report)
-        for report_value in report_values:
-            key = report_value[0].lower().replace("-", "_")
-            parsed_report[key] = report_value[1]
+        # The header parser unfolds continuation lines before field values
+        # are consumed (RFC 5322 §2.2.3 and RFC 9991 Appendix A).
+        report_fields = email.parser.HeaderParser(policy=email.policy.default).parsestr(
+            feedback_report
+        )
+        for field_name, value in report_fields.items():
+            key = field_name.lower().replace("-", "_")
+            parsed_report[key] = str(value)
 
         if "arrival_date" not in parsed_report:
             if msg_date is None:
@@ -1820,8 +1855,8 @@ def parse_failure_report(
 
         # Identity-Alignment is REQUIRED per RFC 9991 §4. Default silently for
         # backward compatibility with pre-9991 reporters, but log so the
-        # offending reporter is visible. Values are CFWS-separated per the
-        # ABNF, so each mechanism is stripped after splitting.
+        # offending reporter is visible. RFC 9991 §4 permits CFWS around
+        # each mechanism and comma separator.
         if "identity_alignment" not in parsed_report:
             logger.warning(
                 "Failure report missing required 'Identity-Alignment' "
@@ -1829,26 +1864,26 @@ def parse_failure_report(
             )
             parsed_report["authentication_mechanisms"] = []
         else:
-            raw_alignment = parsed_report["identity_alignment"].strip()
-            if raw_alignment.lower() == "none":
-                parsed_report["authentication_mechanisms"] = []
-            else:
-                parsed_report["authentication_mechanisms"] = [
-                    m.strip() for m in raw_alignment.split(",") if m.strip()
-                ]
+            mechanisms = _parse_failure_mechanism_list(
+                parsed_report["identity_alignment"], "Identity-Alignment"
+            )
+            parsed_report["authentication_mechanisms"] = (
+                [] if [m.lower() for m in mechanisms] == ["none"] else mechanisms
+            )
             del parsed_report["identity_alignment"]
 
-        # Auth-Failure is REQUIRED per RFC 9991 §4. Comma-separated per ABNF
-        # so strip each token.
+        # Auth-Failure is REQUIRED per RFC 6591 §3.2.1; RFC 9991 §4 adds
+        # the dmarc value. Retain support for reporter-supplied comma lists
+        # as a compatibility extension, applying CFWS handling to each token.
         if "auth_failure" not in parsed_report:
             logger.warning(
                 "Failure report missing required 'Auth-Failure' field "
                 "(RFC 9991 §4); defaulting to 'dmarc'"
             )
             parsed_report["auth_failure"] = "dmarc"
-        parsed_report["auth_failure"] = [
-            f.strip() for f in parsed_report["auth_failure"].split(",") if f.strip()
-        ]
+        parsed_report["auth_failure"] = _parse_failure_mechanism_list(
+            parsed_report["auth_failure"], "Auth-Failure"
+        )
 
         # Feedback-Type is REQUIRED per RFC 5965 §3.1, but some gateways
         # (e.g. Exim/cPanel-based ones that send a plain-text summary without
@@ -2290,13 +2325,12 @@ def parse_report_email(
             is_feedback_report = True
             decoded_payload = _decode_mime_payload(part, payload)
             try:
-                if "Feedback-Type" in decoded_payload:
+                if "feedback-type" in decoded_payload.lower():
                     feedback_report = decoded_payload
                 else:
-                    feedback_report = b64decode(decoded_payload).__str__()
-                feedback_report = feedback_report.lstrip("b'").rstrip("'")
-                feedback_report = feedback_report.replace("\\r", "")
-                feedback_report = feedback_report.replace("\\n", "\n")
+                    feedback_report = b64decode(decoded_payload).decode(
+                        "utf-8", errors="replace"
+                    )
             except (ValueError, TypeError, binascii.Error):
                 feedback_report = decoded_payload
         elif is_feedback_report and content_type in EMAIL_SAMPLE_CONTENT_TYPES:

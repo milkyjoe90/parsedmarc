@@ -3413,6 +3413,85 @@ Test body"""
     def _default_msg_date(self):
         return datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
+    def testFoldedFailureFieldsAreUnfolded(self):
+        """RFC 9991 Appendix A contains folded Authentication-Results.
+
+        RFC 5322 §2.2.3 removes the line break while retaining the field's
+        continuation. Quoted values and literal escapes must survive.
+        """
+        authentication = 'gen.example;\r\n dmarc=fail header.from="example.com"'
+        feedback = self._make_feedback_report(
+            **{
+                "Authentication-Results": authentication,
+                "Identity-Alignment": "dkim,\r\n\tspf",
+                "Auth-Failure": "dmarc,\r\n spf",
+                "User-Agent": r"reporter\new\release'",
+            }
+        )
+        for cte in (None, "base64", "quoted-printable"):
+            with self.subTest(cte=cte):
+                result = parsedmarc.parse_report_email(
+                    build_failure_report_email(
+                        feedback_report=feedback, feedback_report_cte=cte
+                    ),
+                    offline=True,
+                )
+                report = cast(FailureReport, result["report"])
+                self.assertEqual(
+                    report["authentication_results"], authentication.replace("\r\n", "")
+                )
+                self.assertEqual(report["authentication_mechanisms"], ["dkim", "spf"])
+                self.assertEqual(report["auth_failure"], ["dmarc", "spf"])
+                self.assertEqual(report["user_agent"], r"reporter\new\release'")
+
+    def testFailureMechanismCommentsAreCFWS(self):
+        """RFC 5322 §3.2.2 permits nested comments and quoted-pair escapes.
+
+        Commas, quotes, and escaped parentheses inside comments do not
+        introduce mechanisms or alter the separators outside comments.
+        """
+        for alignment, expected in (
+            (
+                r'(outer (nested, "quote") \) tail) dkim, (no aligned SPF) spf',
+                ["dkim", "spf"],
+            ),
+            (r"dkim (escaped \\(nested) end), spf", ["dkim", "spf"]),
+            ("(all successful) none (no failed alignment)", []),
+        ):
+            with self.subTest(alignment=alignment):
+                report = parsedmarc.parse_failure_report(
+                    self._make_feedback_report(
+                        **{
+                            "Identity-Alignment": alignment,
+                            "Auth-Failure": "(explanation, detail) dmarc (outer (inner))",
+                        }
+                    ),
+                    self._make_sample(),
+                    self._default_msg_date(),
+                    offline=True,
+                )
+                self.assertEqual(report["authentication_mechanisms"], expected)
+                self.assertEqual(report["auth_failure"], ["dmarc"])
+
+    def testMalformedMechanismCFWSIsRejected(self):
+        """RFC 9991 §4 names bare mechanisms; RFC 5322 comments must close."""
+        for field in ("Identity-Alignment", "Auth-Failure"):
+            for value in (
+                '"dkim,spf"',
+                "dkim (unclosed",
+                "dkim )",
+                "dk (middle) im",
+                "dkim (escape\\",
+            ):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaisesRegex(parsedmarc.InvalidFailureReport, field):
+                        parsedmarc.parse_failure_report(
+                            self._make_feedback_report(**{field: value}),
+                            self._make_sample(),
+                            self._default_msg_date(),
+                            offline=True,
+                        )
+
     def testMissingVersion(self):
         """Missing version defaults to None"""
         report_str = self._make_feedback_report()
@@ -3490,8 +3569,11 @@ Test body"""
         self.assertEqual(report["authentication_mechanisms"], ["dkim", "spf"])
 
     def testAuthFailureCFWSWhitespaceStripped(self):
-        """Auth-Failure (also comma-separated per RFC 9991) is whitespace-
-        stripped per token."""
+        """Legacy comma-separated Auth-Failure values remain supported.
+
+        RFC 6591 §4 permits CFWS around a single value; accepting a list
+        remains a parser compatibility extension.
+        """
         report_str = self._make_feedback_report(**{"Auth-Failure": "dmarc, spf"})
         report = parsedmarc.parse_failure_report(
             report_str, self._make_sample(), self._default_msg_date(), offline=True
