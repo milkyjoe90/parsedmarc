@@ -7,6 +7,7 @@ import importlib.machinery
 import io
 import json
 import logging
+import mailbox
 import os
 import signal
 import stat
@@ -16,7 +17,9 @@ import unittest
 import zipfile
 from collections.abc import Iterator, Sequence
 from configparser import ConfigParser
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
+from email.message import EmailMessage
+from pathlib import Path
 from tempfile import NamedTemporaryFile
 from types import ModuleType, SimpleNamespace
 from typing import cast
@@ -5214,9 +5217,9 @@ password = test-password
         mock_save_aggregate,
     ):
         """A run combining a file argument and a mailbox saves in two passes:
-        the mailbox batch inside save_callback, the file-derived reports
-        afterward. The final pass must run on the file snapshot alone --
-        running it on the combined results would send every mailbox report
+        the file-derived reports first, then the mailbox batch inside
+        save_callback. Each pass must run on its own batch -- running it
+        on the combined results would send every mailbox report
         to every destination a second time."""
         mock_imap_connection.return_value = object()
         mailbox_report = {"policy_published": {"domain": "mailbox.example.com"}}
@@ -7838,6 +7841,202 @@ class TestOptionalIntegrationExtras(unittest.TestCase):
                     f"The [{section}] configuration section requires the {extra} "
                     f"extra: pip install parsedmarc[{extra}]",
                 )
+
+
+class TestCLIArchiveAfterSave(unittest.TestCase):
+    """Exercise the CLI with real files, output writes, mbox and Maildir.
+
+    Authority: process_reports() and get_dmarc_reports_from_mailbox()'s
+    save_callback contract: archive and commit dedup state only after every
+    report destination accepts the batch. A failed destination must leave
+    an input available for retry, for both returned and raised failures.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.archive = self.root / "archive"
+        self.output = self.root / "output"
+        self.xml = Path("samples/aggregate/rfc9990-sample.xml").read_bytes()
+        parsedmarc.SEEN_AGGREGATE_REPORT_IDS.clear()
+        self.addCleanup(parsedmarc.SEEN_AGGREGATE_REPORT_IDS.clear)
+        for name in ("SIGHUP", "SIGTERM", "SIGINT"):
+            if hasattr(signal, name):
+                sig = getattr(signal, name)
+                self.addCleanup(signal.signal, sig, signal.getsignal(sig))
+
+    def _file(self, name="report.xml", data=None):
+        path = self.root / name
+        path.write_bytes(self.xml if data is None else data)
+        return path
+
+    def _message(self):
+        message = EmailMessage()
+        message["From"] = "reporter@example.net"
+        message["To"] = "reports@example.com"
+        message["Date"] = "Mon, 01 Sep 2025 00:00:00 +0000"
+        message.set_content("Aggregate report attached")
+        message.add_attachment(
+            self.xml, maintype="application", subtype="xml", filename="report.xml"
+        )
+        return message
+
+    def _config(self, *, fail=False, maildir=None, archive=True):
+        path = self.root / "config.ini"
+        text = (
+            "[general]\noffline = true\nsilent = true\n"
+            f"output = {self.output}\nfail_on_output_error = {str(fail).lower()}\n"
+        )
+        if archive:
+            text += f"archive_directory = {self.archive}\n"
+        if maildir is not None:
+            text += f"\n[maildir]\npath = {maildir}\ncreate = false\n"
+        path.write_text(text)
+        return path
+
+    def _run(self, config, *paths):
+        with (
+            patch.object(
+                sys, "argv", ["parsedmarc", "-c", str(config), *map(str, paths)]
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            parsedmarc.cli._main()
+
+    def _assert_saved_once(self):
+        reports = json.loads((self.output / "aggregate.json").read_text())
+        self.assertEqual(len(reports), 1)
+        report = reports[0]
+        self.assertEqual(report["policy_published"]["domain"], "example.com")
+        self.assertEqual(
+            report["report_metadata"]["report_id"], "3v98abbp8ya9n3va8yr8oa3ya"
+        )
+        self.assertEqual(sum(row["count"] for row in report["records"]), 123)
+        self.assertEqual(len(parsedmarc.SEEN_AGGREGATE_REPORT_IDS), 1)
+
+    def test_success_saves_one_report_then_archives_both_file_copies(self):
+        """The save_callback acknowledgment contract also applies to files."""
+        first = self._file()
+        second = self._file("copy.xml")
+        self._run(self._config(), first, second)
+        self._assert_saved_once()
+        self.assertFalse(first.exists())
+        self.assertFalse(second.exists())
+        archived = list(self.archive.rglob("*.xml"))
+        self.assertEqual(len(archived), 2)
+        self.assertTrue(all(path.read_bytes() == self.xml for path in archived))
+
+    def test_output_failure_retains_file_and_mbox_dedup_state_for_retry(self):
+        """A returned error or ParserError must not commit unsaved IDs."""
+        for fail in (False, True):
+            with (
+                self.subTest(fail_on_output_error=fail),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                self.root = Path(directory)
+                self.archive = self.root / "archive"
+                self.output = self.root / "output"
+                parsedmarc.SEEN_AGGREGATE_REPORT_IDS.clear()
+                source = self._file()
+                box_path = self.root / "reports.mbox"
+                box = mailbox.mbox(str(box_path))
+                box.add(self._message())
+                box.close()
+                original_mbox = box_path.read_bytes()
+                self.output.write_text("blocks output directory creation")
+                config = self._config(fail=fail)
+                if fail:
+                    with self.assertRaises(SystemExit) as context:
+                        self._run(config, source, box_path)
+                    self.assertEqual(context.exception.code, 1)
+                else:
+                    self._run(config, source, box_path)
+                self.assertEqual(source.read_bytes(), self.xml)
+                self.assertEqual(box_path.read_bytes(), original_mbox)
+                self.assertFalse(self.archive.exists())
+                self.assertEqual(len(parsedmarc.SEEN_AGGREGATE_REPORT_IDS), 0)
+                self.output.unlink()
+                self._run(config, source, box_path)
+                self._assert_saved_once()
+                self.assertFalse(source.exists())
+                self.assertEqual(box_path.read_bytes(), original_mbox)
+
+    def test_invalid_file_is_quarantined_while_unsaved_valid_file_is_retained(self):
+        """Only invalid input is quarantined before the save acknowledgment."""
+        valid = self._file()
+        invalid = self._file("bad.xml", b"This is not a report")
+        self.output.write_text("blocked")
+        self._run(self._config(), valid, invalid)
+        self.assertEqual(valid.read_bytes(), self.xml)
+        self.assertFalse(invalid.exists())
+        self.assertEqual(
+            (self.archive / "Invalid" / "bad.xml").read_bytes(), b"This is not a report"
+        )
+        self.assertEqual(list(self.archive.rglob("report.xml")), [])
+        self.assertEqual(len(parsedmarc.SEEN_AGGREGATE_REPORT_IDS), 0)
+
+    def test_mbox_only_failure_does_not_commit_ids_before_retry(self):
+        """The shared save acknowledgment applies to mbox classification too."""
+        box_path = self.root / "reports.mbox"
+        box = mailbox.mbox(str(box_path))
+        box.add(self._message())
+        box.close()
+        original_mbox = box_path.read_bytes()
+        self.output.write_text("blocked")
+        config = self._config()
+        self._run(config, box_path)
+        self.assertEqual(len(parsedmarc.SEEN_AGGREGATE_REPORT_IDS), 0)
+        self.assertEqual(box_path.read_bytes(), original_mbox)
+        self.output.unlink()
+        self._run(config, box_path)
+        self._assert_saved_once()
+        self.assertEqual(box_path.read_bytes(), original_mbox)
+        self.assertFalse(self.archive.exists())
+
+    def test_failed_file_output_cannot_discard_a_maildir_copy_as_duplicate(self):
+        """Mailbox disposal requires a durable copy, not a file parse alone."""
+        source = self._file()
+        maildir = mailbox.Maildir(str(self.root / "maildir"), create=True)
+        self.addCleanup(maildir.close)
+        key = maildir.add(self._message())
+        original_message = maildir.get_bytes(key)
+        self.output.write_text("blocked")
+        config = self._config(maildir=self.root / "maildir")
+        self._run(config, source)
+        self.assertEqual(source.read_bytes(), self.xml)
+        self.assertEqual(maildir.get_bytes(key), original_message)
+        self.assertEqual(len(maildir), 1)
+        self.assertFalse(self.archive.exists())
+        self.assertEqual(len(parsedmarc.SEEN_AGGREGATE_REPORT_IDS), 0)
+        self.output.unlink()
+        self._run(config, source)
+        self._assert_saved_once()
+        self.assertFalse(source.exists())
+        self.assertEqual(len(maildir), 0)
+
+    def test_later_maildir_failure_does_not_lose_the_saved_file_batch(self):
+        """File output is acknowledged before starting another input source."""
+        source = self._file()
+        config = self._config(maildir=self.root / "missing-maildir")
+        with self.assertRaises(SystemExit) as context:
+            self._run(config, source)
+        self.assertEqual(context.exception.code, 1)
+        self._assert_saved_once()
+        self.assertFalse(source.exists())
+        self.assertEqual(len(list(self.archive.rglob("report.xml"))), 1)
+
+    def test_unsaved_file_is_retryable_even_without_archiving_enabled(self):
+        """Deduplication's save contract is independent of archive settings."""
+        source = self._file()
+        self.output.write_text("blocked")
+        config = self._config(archive=False)
+        self._run(config, source)
+        self.assertEqual(len(parsedmarc.SEEN_AGGREGATE_REPORT_IDS), 0)
+        self.output.unlink()
+        self._run(config, source)
+        self._assert_saved_once()
+        self.assertEqual(source.read_bytes(), self.xml)
 
 
 if __name__ == "__main__":

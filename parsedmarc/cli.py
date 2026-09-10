@@ -15,6 +15,7 @@ import sys
 import time
 from argparse import ArgumentParser, Namespace
 from configparser import ConfigParser
+from dataclasses import replace
 from glob import escape as glob_escape, glob
 from ssl import CERT_NONE, create_default_context
 from typing import TYPE_CHECKING, Any
@@ -111,6 +112,7 @@ else:
 
 
 from parsedmarc.constants import DEFAULT_DNS_MAX_RETRIES, DEFAULT_DNS_TIMEOUT
+from parsedmarc.config import _new_seen_aggregate_report_ids
 from parsedmarc.log import logger
 import parsedmarc.mail
 from parsedmarc.mail import (
@@ -457,7 +459,10 @@ def _move_file_to_archive(file_path: str, dest_dir: str) -> str:
 def _archive_processed_file(
     file_path: str, archive_directory: str, result: ParsedReport | Exception
 ) -> None:
-    """Move *file_path* into *archive_directory* after processing.
+    """Move an invalid file, or a successfully saved report, into the archive.
+
+    For a successful parse, the caller must first confirm that every
+    configured report output accepted the batch.
 
     Files that failed to parse as a report (*result* is a
     ``ParserError`` — every parse-failure exception, including
@@ -2964,8 +2969,15 @@ def _main():
         n_procs = 1
 
     parser_config = _build_parser_config(opts)
+    # File and mbox reports are not durable until process_reports succeeds.
+    # Keep their duplicate keys private to this batch until that acknowledgment.
+    file_seen_report_ids = _new_seen_aggregate_report_ids()
+    file_parser_config = replace(
+        parser_config, seen_aggregate_report_ids=file_seen_report_ids
+    )
+    files_pending_archive: list[tuple[str, ParsedReport]] = []
 
-    func = functools.partial(_parse_report_file_job, config=parser_config)
+    func = functools.partial(_parse_report_file_job, config=file_parser_config)
     for file_path, result in parallel_map(
         func, file_paths, n_procs, should_stop=lambda: _shutdown_requested
     ):
@@ -2973,13 +2985,18 @@ def _main():
             pbar.update(1)
         if isinstance(result, Exception):
             logger.error(f"Failed to parse {file_path} - {result}")
+            if opts.archive_directory:
+                _archive_processed_file(file_path, opts.archive_directory, result)
         else:
             if result["report_type"] == "aggregate":
                 report_org = result["report"]["report_metadata"]["org_name"]
                 report_id = result["report"]["report_metadata"]["report_id"]
                 report_key = _aggregate_report_key(result["report"])
-                if report_key not in SEEN_AGGREGATE_REPORT_IDS:
-                    SEEN_AGGREGATE_REPORT_IDS[report_key] = True
+                if (
+                    report_key not in SEEN_AGGREGATE_REPORT_IDS
+                    and report_key not in file_seen_report_ids
+                ):
+                    file_seen_report_ids[report_key] = True
                     aggregate_reports.append(result["report"])
                 else:
                     logger.debug(
@@ -2990,8 +3007,8 @@ def _main():
                 failure_reports.append(result["report"])
             elif result["report_type"] == "smtp_tls":
                 smtp_tls_reports.append(result["report"])
-        if opts.archive_directory:
-            _archive_processed_file(file_path, opts.archive_directory, result)
+            if opts.archive_directory:
+                files_pending_archive.append((file_path, result))
 
     if pbar is not None:
         pbar.close()
@@ -3009,25 +3026,41 @@ def _main():
             break
         reports = get_dmarc_reports_from_mbox(
             mbox_path,
-            config=parser_config,
+            config=file_parser_config,
             n_procs=n_procs,
         )
-        aggregate_reports += reports["aggregate_reports"]
+        aggregate_reports += [
+            report
+            for report in reports["aggregate_reports"]
+            if _aggregate_report_key(report) not in SEEN_AGGREGATE_REPORT_IDS
+        ]
         failure_reports += reports["failure_reports"]
         smtp_tls_reports += reports["smtp_tls_reports"]
 
-    # Snapshot of the file/mbox-derived reports, taken before the mailbox
-    # block below appends anything fetched from a live mailbox connection.
-    # Mailbox batches are handed to process_reports() by
-    # mailbox_save_callback() before get_dmarc_reports_from_mailbox() even
-    # returns -- that is what lets it decide whether archiving is safe -- so
-    # the final process_reports() call runs on this snapshot only, or the
-    # mailbox-derived reports would be saved twice.
+    # Save files before fetching mailbox copies: a mailbox duplicate may be
+    # discarded only after the file-derived report reached every destination.
     file_parsing_results: ParsingResults = {
         "aggregate_reports": list(aggregate_reports),
         "failure_reports": list(failure_reports),
         "smtp_tls_reports": list(smtp_tls_reports),
     }
+    file_results_nonempty = bool(
+        file_parsing_results["aggregate_reports"]
+        or file_parsing_results["failure_reports"]
+        or file_parsing_results["smtp_tls_reports"]
+    )
+    try:
+        file_output_errors = (
+            process_reports(file_parsing_results) if file_results_nonempty else []
+        )
+    except ParserError as error:
+        logger.error(str(error))
+        sys.exit(1)
+    if not file_output_errors:
+        for report in file_parsing_results["aggregate_reports"]:
+            SEEN_AGGREGATE_REPORT_IDS[_aggregate_report_key(report)] = True
+        for file_path, result in files_pending_archive:
+            _archive_processed_file(file_path, opts.archive_directory, result)
 
     mailbox_connection = None
     msgraph_connection: MSGraphConnection | None = None
@@ -3283,16 +3316,9 @@ def _main():
         "smtp_tls_reports": filter_smtp_tls_reports_for_index_prefix(smtp_tls_reports),
     }
 
-    file_results_nonempty = bool(
-        file_parsing_results["aggregate_reports"]
-        or file_parsing_results["failure_reports"]
-        or file_parsing_results["smtp_tls_reports"]
-    )
-    # Mailbox-derived reports were already saved by mailbox_save_callback;
-    # only file/mbox-derived reports are left to save here. With a mailbox
-    # connection and nothing from files, skip the call entirely so the run
-    # doesn't print a second, empty JSON blob.
-    if file_results_nonempty or not mailbox_connection:
+    # Preserve the empty output for a file-only run. Nonempty file batches
+    # and mailbox batches have each already been saved once above.
+    if not file_results_nonempty and not mailbox_connection:
         try:
             process_reports(file_parsing_results)
         except ParserError as error:

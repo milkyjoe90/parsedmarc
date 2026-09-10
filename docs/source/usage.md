@@ -138,7 +138,8 @@ The full set of configuration options is:
       and CSV filename options below only take effect when this is set.
   - `archive_directory` - str: Optional. When set, successfully
       processed report files given as local file/directory path
-      arguments are moved into
+      arguments are moved only after their batch reaches every configured
+      report output, into
       `<archive_directory>/<year>/<month>/<Aggregate|Failure|SMTP-TLS>/`
       (year and month come from the report's own begin/arrival date, with
       the month zero-padded). A successfully parsed report whose archive
@@ -153,7 +154,13 @@ The full set of configuration options is:
       Maildir) use `[mailbox] archive_folder` instead, and mbox files are
       never moved. Files already inside `archive_directory` are excluded
       from processing, so the archive may safely live inside an input
-      directory. A failed move is logged and does not stop the run.
+      directory. A failed output leaves the batch's files in place for retry,
+      whether or not `fail_on_output_error` is enabled. Files and mbox
+      reports are saved before live mailbox ingestion so an unsaved file
+      cannot cause a mailbox copy to be discarded as a duplicate. If only
+      some outputs succeed, retrying may deliver those reports again to
+      the successful destinations. A failed move is logged and does not
+      stop the run.
   - `aggregate_json_filename` - str: filename for the aggregate
       JSON output file
   - `failure_json_filename` - str: filename for the failure
