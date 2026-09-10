@@ -1177,45 +1177,46 @@ def parse_aggregate_report_xml(
         new_policy_published["discovery_method"] = discovery_method
         new_report["policy_published"] = new_policy_published
 
-        if type(report["record"]) is list:
-            for i in range(len(report["record"])):
-                if keep_alive is not None and i > 0 and i % 20 == 0:
-                    logger.debug("Sending keepalive cmd")
-                    keep_alive()
-                    logger.debug("Processed {}/{}".format(i, len(report["record"])))
-                try:
-                    report_record = _parse_report_record(
-                        report["record"][i],
-                        config=cfg,
-                        is_rfc_9990=is_rfc_9990,
-                    )
-                    _append_parsed_record(
-                        parsed_record=report_record,
-                        records=records,
-                        begin_dt=begin_dt,
-                        end_dt=end_dt,
-                        normalize=normalize_timespan,
-                    )
-                except Exception as e:
-                    logger.warning(f"Could not parse record: {e}")
+        raw_records = report.get("record")
+        if raw_records is None:
+            raise InvalidAggregateReport("Report must contain at least one record")
+        if not isinstance(raw_records, list):
+            raw_records = [raw_records]
+        for i, raw_record in enumerate(raw_records):
+            if keep_alive is not None and i > 0 and i % 20 == 0:
+                logger.debug("Sending keepalive cmd")
+                keep_alive()
+                logger.debug(f"Processed {i}/{len(raw_records)}")
+            try:
+                report_record = _parse_report_record(
+                    raw_record,
+                    config=cfg,
+                    is_rfc_9990=is_rfc_9990,
+                )
+                _append_parsed_record(
+                    parsed_record=report_record,
+                    records=records,
+                    begin_dt=begin_dt,
+                    end_dt=end_dt,
+                    normalize=normalize_timespan,
+                )
+            except Exception as error:
+                # Returning the surviving rows would silently undercount the
+                # report. RFC 9990 section 3.1.1 recommends discarding reports
+                # with an invalid format rather than trusting partial data.
+                raise InvalidAggregateReport(
+                    f"Could not parse record {i + 1}: {error}"
+                ) from error
 
-        else:
-            report_record = _parse_report_record(
-                report["record"],
-                config=cfg,
-                is_rfc_9990=is_rfc_9990,
-            )
-            _append_parsed_record(
-                parsed_record=report_record,
-                records=records,
-                begin_dt=begin_dt,
-                end_dt=end_dt,
-                normalize=normalize_timespan,
-            )
+        if not records:
+            raise InvalidAggregateReport("Report must contain at least one record")
 
         new_report["records"] = records
 
         return cast(AggregateReport, new_report)
+
+    except InvalidAggregateReport:
+        raise
 
     except expat.ExpatError as error:
         raise InvalidAggregateReport(f"Invalid XML: {error.__str__()}") from error

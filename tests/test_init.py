@@ -2710,8 +2710,12 @@ class TestPolicyPublishedEdgeCases(unittest.TestCase):
         self.assertIn("error1", report["report_metadata"]["errors"])
         self.assertIn("error2", report["report_metadata"]["errors"])
 
-    def testRecordParseFailureSkipped(self):
-        """Bad records are skipped with a warning, not crashing"""
+    def testRecordParseFailureRejectsWholeReport(self):
+        """RFC 9990 section 3.1.1 recommends discarding malformed reports.
+
+        https://www.rfc-editor.org/rfc/rfc9990.html#section-3.1.1
+        A bad second row must not return the valid first row as a complete report.
+        """
         xml = """<?xml version="1.0"?>
 <feedback>
   <report_metadata>
@@ -2736,9 +2740,60 @@ class TestPolicyPublishedEdgeCases(unittest.TestCase):
     <auth_results><spf><domain>example.com</domain><result>pass</result></spf></auth_results>
   </record>
 </feedback>"""
-        report = parsedmarc.parse_aggregate_report_xml(xml, offline=True)
-        # At least the valid record should be parsed
-        self.assertGreaterEqual(len(report["records"]), 1)
+        with self.assertRaisesRegex(parsedmarc.InvalidAggregateReport, "record 2"):
+            parsedmarc.parse_aggregate_report_xml(xml, offline=True)
+
+    def testValidCountCannotHideMalformedRecordFields(self):
+        """RFC 9990 3.1.1 recommends discarding malformed record structures.
+
+        https://www.rfc-editor.org/rfc/rfc9990.html#section-3.1.1
+        A row whose count is valid still invalidates the report if its required
+        identifiers cannot be parsed.
+        """
+        xml = _minimal_aggregate_xml()
+        record = xml[xml.index("<record>") : xml.index("</record>") + 9]
+        bad_record = record.replace(
+            "<identifiers><header_from>example.com</header_from></identifiers>",
+            "<identifiers/>",
+        )
+        with self.assertRaisesRegex(parsedmarc.InvalidAggregateReport, "record 2"):
+            parsedmarc.parse_aggregate_report_xml(
+                xml.replace(record, record + bad_record), offline=True
+            )
+
+    def testNormalizationCannotReturnAnEmptySuccessfulReport(self):
+        """RFC 9990 3.1.1.2 requires at least one reported record.
+
+        https://www.rfc-editor.org/rfc/rfc9990.html#section-3.1.1.2
+        If normalization produces no rows, report failure instead of returning
+        an empty success that downstream consumers cannot reconcile.
+        """
+        xml = (
+            _minimal_aggregate_xml()
+            .replace("1704153599", "1704326400")
+            .replace("<count>1</count>", "<count>0</count>")
+        )
+        with self.assertRaisesRegex(
+            parsedmarc.InvalidAggregateReport, "at least one record"
+        ):
+            parsedmarc.parse_aggregate_report_xml(xml, offline=True)
+
+    def testMultipleRecordsKeepConnectionAliveAndPreserveCounts(self):
+        """AggregateReport.records retains every count (parsedmarc/types.py).
+
+        The valid-record loop still services the ingestion connection during a
+        long report; the callback must not interrupt or omit record processing.
+        """
+        xml = _minimal_aggregate_xml()
+        record = xml[xml.index("<record>") : xml.index("</record>") + 9]
+        keepalive_events = []
+        report = parsedmarc.parse_aggregate_report_xml(
+            xml.replace(record, record * 21),
+            offline=True,
+            keep_alive=lambda: keepalive_events.append("keepalive"),
+        )
+        self.assertEqual([row["count"] for row in report["records"]], [1] * 21)
+        self.assertEqual(keepalive_events, ["keepalive"])
 
 
 class TestParseReportFile(unittest.TestCase):
@@ -4225,6 +4280,29 @@ class TestGetDmarcReportsFromMailboxMaildir(unittest.TestCase):
         )
         return conn, result
 
+    def testIncompleteAggregateIsQuarantinedIntact(self):
+        """RFC 9990 section 3.1.1: malformed rows invalidate their report.
+
+        https://www.rfc-editor.org/rfc/rfc9990.html#section-3.1.1
+        The original must reach Invalid, never the successful Aggregate archive.
+        """
+        xml = _minimal_aggregate_xml()
+        record = xml[xml.index("<record>") : xml.index("</record>") + 9]
+        xml = xml.replace(record, record + "<record><row/></record>")
+        msg = MIMEMultipart()
+        msg.attach(MIMEText(xml, "xml", "utf-8"))
+        self._deliver(msg.as_bytes())
+        conn, result = self._run()
+        self.assertEqual(result["aggregate_reports"], [])
+        self.assertEqual(conn.fetch_messages("Archive/Aggregate"), [])
+        invalid = conn.fetch_messages("Archive/Invalid")
+        self.assertEqual(len(invalid), 1)
+        restored = email.message_from_string(conn.fetch_message(invalid[0]))
+        attachment = next(
+            part for part in restored.walk() if part.get_content_type() == "text/xml"
+        )
+        self.assertEqual(attachment.get_payload(decode=True), xml.encode("utf-8"))
+
     def _assert_each_report_type_routed(self, conn, result):
         """Shared assertions for one report of each type plus an
         unparseable message: each is filed under the correct subfolder
@@ -5448,6 +5526,39 @@ def _minimal_aggregate_xml(
 
 class TestAggregateReportEdgeCases(unittest.TestCase):
     """Parsing edge cases for aggregate report XML documents."""
+
+    def testInvalidRowsNeverReturnAnEmptySuccessfulReport(self):
+        """RFC 9990 sections 3.1.1 and 3.1.1.2 require usable record data.
+
+        https://www.rfc-editor.org/rfc/rfc9990.html#section-3.1.1.2
+        """
+        xml = _minimal_aggregate_xml()
+        record_start, record_end = xml.index("<record>"), xml.index("</record>") + 9
+        record = xml[record_start:record_end]
+        for rows in (
+            record.replace("<count>1</count>", "<count>invalid</count>"),
+            record.replace("<count>1</count>", "<count>invalid</count>") * 2,
+            "",
+            "<record/>",
+        ):
+            with self.subTest(rows=rows):
+                with self.assertRaises(parsedmarc.InvalidAggregateReport):
+                    parsedmarc.parse_aggregate_report_xml(
+                        xml[:record_start] + rows + xml[record_end:], offline=True
+                    )
+
+    def testValidMultiRecordReportPreservesEveryCount(self):
+        """RFC 9990 section 3.1.1.2 permits one or more records.
+
+        https://www.rfc-editor.org/rfc/rfc9990.html#section-3.1.1.2
+        """
+        xml = _minimal_aggregate_xml()
+        record = xml[xml.index("<record>") : xml.index("</record>") + 9]
+        report = parsedmarc.parse_aggregate_report_xml(
+            xml.replace(record, record + record.replace("<count>1", "<count>7")),
+            offline=True,
+        )
+        self.assertEqual([row["count"] for row in report["records"]], [1, 7])
 
     def testBytesInputIsDecoded(self):
         """parse_aggregate_report_xml accepts bytes input"""
