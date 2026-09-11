@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from ssl import SSLContext, create_default_context
 from typing import TYPE_CHECKING, Any
 
@@ -84,6 +85,7 @@ class KafkaClient(object):
         and removes report_metadata key to bring it more in line
         with Elastic output.
         """
+        report = deepcopy(report)
         report["org_name"] = report["report_metadata"]["org_name"]
         report["org_email"] = report["report_metadata"]["org_email"]
         report["report_id"] = report["report_metadata"]["report_id"]
@@ -101,8 +103,10 @@ class KafkaClient(object):
         """
 
         metadata = report["report_metadata"]
-        begin_date = human_timestamp_to_datetime(metadata["begin_date"])
-        end_date = human_timestamp_to_datetime(metadata["end_date"])
+        begin_date = human_timestamp_to_datetime(
+            metadata["begin_date"], assume_utc=True
+        )
+        end_date = human_timestamp_to_datetime(metadata["end_date"], assume_utc=True)
         begin_date_human = begin_date.strftime("%Y-%m-%dT%H:%M:%S")
         end_date_human = end_date.strftime("%Y-%m-%dT%H:%M:%S")
         date_range = [begin_date_human, end_date_human]
@@ -130,8 +134,12 @@ class KafkaClient(object):
             return
 
         for report in aggregate_reports:
-            report["date_range"] = self.generate_date_range(report)
-            report = self.strip_metadata(report)
+            report = self.strip_metadata(
+                {
+                    **report,
+                    "date_range": self.generate_date_range(report),
+                }
+            )
 
             for slice in report["records"]:
                 slice["date_range"] = report["date_range"]
@@ -142,7 +150,7 @@ class KafkaClient(object):
                 logger.debug("Sending slice.")
                 try:
                     logger.debug("Saving aggregate report to Kafka")
-                    self.producer.send(aggregate_topic, slice)
+                    future = self.producer.send(aggregate_topic, slice)
                 except UnknownTopicOrPartitionError:
                     raise KafkaError(
                         "Kafka error: Unknown topic or partition on broker"
@@ -151,6 +159,8 @@ class KafkaClient(object):
                     raise KafkaError(f"Kafka error: {e.__str__()}")
                 try:
                     self.producer.flush()
+                    # flush() waits for completion, including failed sends.
+                    future.get(timeout=0)
                 except Exception as e:
                     raise KafkaError(f"Kafka error: {e.__str__()}")
 
@@ -185,13 +195,14 @@ class KafkaClient(object):
         for report in failure_reports:
             try:
                 logger.debug("Saving failure report to Kafka")
-                self.producer.send(failure_topic, report)
+                future = self.producer.send(failure_topic, report)
             except UnknownTopicOrPartitionError:
                 raise KafkaError("Kafka error: Unknown topic or partition on broker")
             except Exception as e:
                 raise KafkaError(f"Kafka error: {e.__str__()}")
             try:
                 self.producer.flush()
+                future.get(timeout=0)
             except Exception as e:
                 raise KafkaError(f"Kafka error: {e.__str__()}")
 
@@ -227,12 +238,13 @@ class KafkaClient(object):
         for report in smtp_tls_reports:
             try:
                 logger.debug("Saving SMTP TLS report to Kafka")
-                self.producer.send(smtp_tls_topic, report)
+                future = self.producer.send(smtp_tls_topic, report)
             except UnknownTopicOrPartitionError:
                 raise KafkaError("Kafka error: Unknown topic or partition on broker")
             except Exception as e:
                 raise KafkaError(f"Kafka error: {e.__str__()}")
             try:
                 self.producer.flush()
+                future.get(timeout=0)
             except Exception as e:
                 raise KafkaError(f"Kafka error: {e.__str__()}")

@@ -8041,3 +8041,63 @@ class TestCLIArchiveAfterSave(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestKafkaFileAcknowledgment(unittest.TestCase):
+    """Exercise actual CLI, parser, Kafka serializer, file output and archive."""
+
+    def test_file_retry_archives_only_after_kafka_acknowledges(self):
+        import json
+        import signal
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        import parsedmarc
+        import parsedmarc.cli
+
+        for name in ("SIGHUP", "SIGINT", "SIGTERM"):
+            if hasattr(signal, name):
+                number = getattr(signal, name)
+                self.addCleanup(signal.signal, number, signal.getsignal(number))
+        parsedmarc.SEEN_AGGREGATE_REPORT_IDS.clear()
+        self.addCleanup(parsedmarc.SEEN_AGGREGATE_REPORT_IDS.clear)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "report.xml"
+            source.write_bytes(
+                Path("samples/aggregate/rfc9990-sample.xml").read_bytes()
+            )
+            config = root / "config.ini"
+            config.write_text(
+                "[general]\noffline = true\nsilent = true\nsave_aggregate = true\n"
+                f"output = {root / 'output'}\narchive_directory = {root / 'archive'}\n"
+                "[kafka]\nhosts = broker.example:9092\naggregate_topic = aggregate\n"
+                "failure_topic = failure\nsmtp_tls_topic = tls\n"
+            )
+            with patch("parsedmarc.kafkaclient.KafkaProducer") as factory:
+                producer = factory.return_value
+                producer.send.return_value.get.side_effect = RuntimeError(
+                    "delivery failed"
+                )
+                with patch.object(
+                    sys, "argv", ["parsedmarc", "-c", str(config), str(source)]
+                ):
+                    parsedmarc.cli._main()
+                self.assertTrue(source.exists())
+                self.assertEqual(len(parsedmarc.SEEN_AGGREGATE_REPORT_IDS), 0)
+                producer.send.return_value.get.side_effect = None
+                with patch.object(
+                    sys, "argv", ["parsedmarc", "-c", str(config), str(source)]
+                ):
+                    parsedmarc.cli._main()
+                self.assertFalse(source.exists())
+                self.assertEqual(len(parsedmarc.SEEN_AGGREGATE_REPORT_IDS), 1)
+                self.assertEqual(len(list((root / "archive").rglob("*.xml"))), 1)
+                reports = json.loads((root / "output" / "aggregate.json").read_text())
+                self.assertEqual(len(reports), 1)
+                self.assertEqual(
+                    sum(row["count"] for row in reports[0]["records"]), 123
+                )
+                payload = producer.send.call_args.args[1]
+                self.assertEqual(payload["policy_published"]["domain"], "example.com")
+                self.assertEqual(payload["report_id"], "3v98abbp8ya9n3va8yr8oa3ya")

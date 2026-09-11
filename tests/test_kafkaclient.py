@@ -309,3 +309,37 @@ class TestKafkaBackwardCompatAlias(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestKafkaIngestionReliability(unittest.TestCase):
+    def test_real_serialization_does_not_mutate_input_or_nested_records(self):
+        from copy import deepcopy
+
+        report = _aggregate_report()
+        original = deepcopy(report)
+        with patch("parsedmarc.kafkaclient.KafkaProducer"):
+            client = KafkaClient(kafka_hosts=["broker:9092"])
+        client.save_aggregate_reports_to_kafka(report, "aggregate")
+        self.assertEqual(report, original)
+        sent = [entry.args[1] for entry in _producer(client).send.call_args_list]
+        self.assertEqual([row["count"] for row in sent], [1, 2])
+        self.assertEqual([row["report_id"] for row in sent], ["r-123", "r-123"])
+        sent[0]["source"]["ip_address"] = "203.0.113.9"
+        self.assertEqual(report, original)
+
+    def test_failed_send_future_is_not_acknowledged_after_flush(self):
+        for method, report in (
+            ("save_aggregate_reports_to_kafka", _aggregate_report()),
+            ("save_failure_reports_to_kafka", {"sample": "failure"}),
+            ("save_smtp_tls_reports_to_kafka", {"report_id": "tls"}),
+        ):
+            with self.subTest(method=method):
+                with patch("parsedmarc.kafkaclient.KafkaProducer"):
+                    client = KafkaClient(kafka_hosts=["broker:9092"])
+                producer = _producer(client)
+                producer.send.return_value.get.side_effect = RuntimeError(
+                    "broker rejected record"
+                )
+                with self.assertRaisesRegex(KafkaError, "broker rejected record"):
+                    getattr(client, method)(report, "reports")
+                producer.flush.assert_called_once()

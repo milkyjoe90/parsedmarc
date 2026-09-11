@@ -23,6 +23,7 @@ from parsedmarc.elastic import (
     set_hosts,
 )
 from tests.tzutil import force_tz
+from tests.test_aggregate_storage import ClientBoundary
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +201,8 @@ def _empty_search():
     """A Search() mock whose .execute() returns an empty hit list."""
     search = MagicMock()
     search.execute.return_value = []
+    search.params.return_value = search
+    search.scan.return_value = []
     return search
 
 
@@ -779,6 +782,50 @@ class TestSaveAggregateReport(unittest.TestCase):
     Document.save. Each test patches the boundary it needs and
     leaves the rest alone."""
 
+    def setUp(self):
+        # Model multi-get at the SDK connection boundary. Document creation,
+        # row signatures, ID assignment and completeness checks stay real.
+        self.storage_client = ClientBoundary()
+        connection = patch(
+            "parsedmarc.elastic.connections.get_connection",
+            return_value=self.storage_client,
+        )
+        connection.start()
+        self.addCleanup(connection.stop)
+
+    def test_partial_write_retries_missing_rows_before_search_refresh(self):
+        report = _aggregate_report()
+        extra = dict(report["records"][0], count=7)
+        report["records"].append(extra)
+        self.storage_client.fail_at = 2
+
+        def save_document(document):
+            self.storage_client.index(
+                document.meta.index, document.meta.id, document.to_dict()
+            )
+
+        with (
+            patch("parsedmarc.elastic.Search", return_value=_empty_search()),
+            patch("parsedmarc.elastic.Index") as indexes,
+            patch.object(
+                elastic_module._AggregateReportDoc,
+                "save",
+                autospec=True,
+                side_effect=save_document,
+            ),
+        ):
+            indexes.return_value.exists.return_value = True
+            with self.assertRaises(ElasticsearchError):
+                save_aggregate_report_to_elasticsearch(report)
+            self.assertEqual(len(self.storage_client.stored), 1)
+            self.storage_client.fail_at = None
+            save_aggregate_report_to_elasticsearch(report)
+            values = list(self.storage_client.stored.values())
+            self.assertEqual(sorted(row["message_count"] for row in values), [4, 7])
+            with self.assertRaises(AlreadySaved):
+                save_aggregate_report_to_elasticsearch(report)
+            self.assertEqual(len(self.storage_client.stored), 2)
+
     def _patches(self, search_factory=_empty_search):
         return [
             patch("parsedmarc.elastic.Search", return_value=search_factory()),
@@ -798,22 +845,36 @@ class TestSaveAggregateReport(unittest.TestCase):
         # Two records → two saves.
         self.assertEqual(mock_save.call_count, 2)
 
-    def test_already_saved_raises_when_search_returns_hit(self):
-        """The dedup query is the only thing preventing
-        double-indexing on re-run. A regression would silently
-        re-save reports, inflating Kibana counts."""
+    def test_already_saved_requires_the_complete_row_set(self):
+        report = _aggregate_report()
+
+        def save_document(document):
+            self.storage_client.index(
+                document.meta.index, document.meta.id, document.to_dict()
+            )
+
         with (
-            patch("parsedmarc.elastic.Search", return_value=_populated_search()),
-            patch("parsedmarc.elastic.Index"),
-            patch.object(elastic_module._AggregateReportDoc, "save") as mock_save,
+            patch("parsedmarc.elastic.Search", return_value=_empty_search()),
+            patch("parsedmarc.elastic.Index") as indexes,
+            patch.object(
+                elastic_module._AggregateReportDoc,
+                "save",
+                autospec=True,
+                side_effect=save_document,
+            ) as saved,
         ):
+            indexes.return_value.exists.return_value = True
+            save_aggregate_report_to_elasticsearch(report)
+            self.assertEqual(saved.call_count, 1)
             with self.assertRaises(AlreadySaved):
-                save_aggregate_report_to_elasticsearch(_aggregate_report())
-        mock_save.assert_not_called()
+                save_aggregate_report_to_elasticsearch(report)
+            self.assertEqual(saved.call_count, 1)
+            self.assertEqual(len(self.storage_client.stored), 1)
 
     def test_search_exception_wraps_to_elasticsearch_error(self):
         bad_search = MagicMock()
-        bad_search.execute.side_effect = RuntimeError("network")
+        bad_search.params.return_value = bad_search
+        bad_search.scan.side_effect = RuntimeError("network")
         with (
             patch("parsedmarc.elastic.Search", return_value=bad_search),
             patch("parsedmarc.elastic.Index"),
@@ -900,27 +961,38 @@ class TestSaveAggregateReport(unittest.TestCase):
 
     @unittest.skipUnless(hasattr(time, "tzset"), "requires POSIX time.tzset()")
     def test_interval_dates_are_utc_regardless_of_host_timezone(self):
-        """interval_begin/interval_end are UTC wall-clock strings (already
-        converted to UTC at parse time in __init__.py); the index-date
-        bucketing and stored date_begin/date_end must use their true UTC
-        epoch on any host. Regression test for
-        https://github.com/domainaware/parsedmarc/issues/819: the naive
-        parse used to shift the stored epoch (and therefore the index
-        date) by the host's UTC offset."""
+        """Both stored rows and the legacy candidate query interpret UTC metadata."""
         force_tz(self)
+        search = _empty_search()
         with (
-            patch("parsedmarc.elastic.Search", return_value=_empty_search()),
-            patch("parsedmarc.elastic.Index") as mock_index_cls,
-            patch("parsedmarc.elastic._AggregateReportDoc") as mock_doc_cls,
+            patch("parsedmarc.elastic.Search", return_value=search),
+            patch("parsedmarc.elastic.Index") as indexes,
+            patch.object(
+                elastic_module._AggregateReportDoc, "save", autospec=True
+            ) as saved,
         ):
-            mock_index_cls.return_value.exists.return_value = True
+            indexes.return_value.exists.return_value = True
             save_aggregate_report_to_elasticsearch(_aggregate_report())
-            index_calls = [c.args[0] for c in mock_index_cls.call_args_list]
-        self.assertIn("dmarc_aggregate-2024-01-15", index_calls)
-        # Fixture begin_date/interval_begin is 2024-01-15 00:00:00 UTC.
-        self.assertEqual(
-            mock_doc_cls.call_args.kwargs["date_begin"].timestamp(), 1705276800
-        )
+        document = saved.call_args.args[0]
+        self.assertEqual(document.date_begin.timestamp(), 1705276800)
+        self.assertEqual(document.date_end.timestamp(), 1705363200)
+        self.assertEqual(document.meta.index, "dmarc_aggregate-2024-01-15")
+
+        def ranges(value):
+            if isinstance(value, dict):
+                if "range" in value:
+                    yield value["range"]
+                for child in value.values():
+                    yield from ranges(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from ranges(child)
+
+        values = list(ranges(search.query.to_dict()))
+        begin = next(row["date_begin"]["gte"] for row in values if "date_begin" in row)
+        end = next(row["date_end"]["lte"] for row in values if "date_end" in row)
+        self.assertEqual(begin.timestamp(), 1705276800)
+        self.assertEqual(end.timestamp(), 1705363200)
 
     def test_save_populates_combined_dkim_and_spf_fields(self):
         """Regression guard for issue #169: two DKIM signatures on one
