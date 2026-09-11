@@ -5,11 +5,13 @@ on:
 permissions:
   contents: read
 jobs:
-  validate:
+  prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     permissions:
       contents: write
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -17,114 +19,113 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
-          ref: 782f37e0669c099ead5c35a046fb4001c9a93619
+          ref: 7b750d14692b16114d36f97a2c8e04a950751689
           path: repository
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
-      - name: Verify and apply reviewed bundle
-        id: apply
-        run: |
-          python - <<'PY'
-          import base64, hashlib, io, json, os, subprocess, zipfile
-          from pathlib import Path
-          tools = Path('validation-tools/.github/ingestion-validation')
-          parts = [(tools / f'part{i}.b64').read_text().strip() for i in range(1, 6)]
-          assert len(parts[3]) == 8831
-          fragment = 'byVoF/1amqu8pVW9yC7ualFvFd0e2ErESdZX3bqipTour3a9VONnUrtqrqi0pBnCLH0iKTJTOczoSuWfECu0NFweqrW8i8VlgJUzhtW7Vpld4lkx9gmewgWlnl9R4sK7l3ehCHVvVa5TNRgUsrckWmyAWE6Fol6aPUomlrWKH'
-          parts[3] = parts[3][:270] + fragment + parts[3][270:]
-          data = base64.b64decode(''.join(parts), validate=True)
-          assert hashlib.sha256(data).hexdigest() == '0a3a1ffffecfb42fb3f321a1d8acda6a531a9a0e58da369f452863cfa6c3b0eb'
-          bundle = Path(os.environ['RUNNER_TEMP']) / 'ingestion-fixes'
-          bundle.mkdir()
-          expected = {'changes.json', 'apply_fixes.py', 'new/parsedmarc/aggregate_storage.py', 'new/parsedmarc/output_storage.py', 'new/tests/test_aggregate_storage.py', 'new/tests/test_output_storage.py'}
-          with zipfile.ZipFile(io.BytesIO(data)) as z:
-              assert set(z.namelist()) == expected
-              z.extractall(bundle)
-          subprocess.run(['python', str(bundle / 'apply_fixes.py'), 'repository', '--apply'], check=True)
-          manifest = json.loads((bundle / 'changes.json').read_text())
-          paths = {e['path'] for e in manifest['edits']}
-          paths.update(p.relative_to(bundle / 'new').as_posix() for p in (bundle / 'new').rglob('*.py'))
-          (Path(os.environ['RUNNER_TEMP']) / 'changed-paths.json').write_text(json.dumps(sorted(paths)))
-          PY
-      - name: Install system dependencies
-        run: |
-          sudo apt-get -q update
-          sudo apt-get -qy install libemail-outlook-message-perl
-      - name: Install project and validation dependencies
-        id: install
+      - name: Apply exact integration corrections
+        working-directory: repository
+        run: python ../validation-tools/.github/ingestion-validation/correct.py
+      - name: Format and lint
         working-directory: repository
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e '.[build,all,postgresql]'
-      - name: Format changed Python files
-        if: steps.install.outcome == 'success'
+          python -m pip install -q ruff==0.16.0
+          python -m ruff format parsedmarc/output_storage.py tests/test_init.py
+          python -m ruff check .
+          python -m ruff format --check .
+      - name: Publish isolated corrected candidate
+        id: commit
         working-directory: repository
         run: |
-          python - <<'PY'
-          import json, os, subprocess
-          from pathlib import Path
-          paths = json.loads((Path(os.environ['RUNNER_TEMP']) / 'changed-paths.json').read_text())
-          subprocess.run(['python', '-m', 'ruff', 'format', *[p for p in paths if p.endswith('.py')]], check=True)
-          PY
+          test "$(git rev-parse HEAD)" = 7b750d14692b16114d36f97a2c8e04a950751689
+          git config user.name ChatGPT
+          git config user.email noreply@openai.com
+          git add parsedmarc/output_storage.py tests/test_init.py docs/source/usage.md
+          git commit -m 'fix: resolve ingestion integration typing and preserve non-array history' -m 'Use the underlying temporary file with its actual IO[str] type, explicitly type parsing results, narrow MIME sample payloads, and assert that unexpected JSON roots are preserved. Document storage recovery, retry and rotation semantics. No production behavior is relaxed to satisfy a test.'
+          branch="codex/ingestion-candidate-${GITHUB_RUN_ID}"
+          git push origin "HEAD:refs/heads/$branch"
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "CANDIDATE_BRANCH=$branch"
+          echo "CANDIDATE_SHA=$sha"
+          echo "Candidate: \`$branch\` at \`$sha\`" >> "$GITHUB_STEP_SUMMARY"
+  tests:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install dependencies
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get -qqy install libemail-outlook-message-perl > /tmp/apt-install.log
+          if [ '${{ matrix.python }}' = 3.13 ]; then
+            python -m pip install -q -e '.[build,all,postgresql]'
+          else
+            python -m pip install -q -e '.[build,all]'
+          fi
       - name: Ruff checks
-        id: lint
-        continue-on-error: true
-        if: steps.install.outcome == 'success'
-        working-directory: repository
         run: |
           python -m ruff check .
           python -m ruff format --check .
       - name: Pyright
-        id: types
-        continue-on-error: true
-        if: steps.install.outcome == 'success'
-        working-directory: repository
+        if: matrix.python == '3.13'
         run: python -m pyright
-      - name: Repository tests
-        id: tests
-        continue-on-error: true
-        if: steps.install.outcome == 'success'
-        working-directory: repository
-        run: python -m pytest --tb=short -q tests/
-      - name: Publish isolated candidate, never the target branch
-        if: always() && steps.apply.outcome == 'success'
-        working-directory: repository
-        env:
-          LINT_OUTCOME: ${{ steps.lint.outcome }}
-          TYPE_OUTCOME: ${{ steps.types.outcome }}
-          TEST_OUTCOME: ${{ steps.tests.outcome }}
+      - name: Complete repository test suite
+        run: python -m pytest --tb=short --disable-warnings -q tests/
+      - name: Distribution and documentation builds
+        if: matrix.python == '3.13'
         run: |
-          python - <<'PY'
-          import json, os, subprocess
-          from pathlib import Path
-          paths = json.loads((Path(os.environ['RUNNER_TEMP']) / 'changed-paths.json').read_text())
-          def git(*args):
-              return subprocess.check_output(['git', *args], text=True).strip()
-          assert git('rev-parse', 'HEAD') == '782f37e0669c099ead5c35a046fb4001c9a93619'
-          git('config', 'user.name', 'ChatGPT')
-          git('config', 'user.email', 'noreply@openai.com')
-          git('add', '--', *paths)
-          staged = set(git('diff', '--cached', '--name-only').splitlines())
-          assert staged and staged <= set(paths)
-          statuses = ', '.join(f'{key}={os.environ[key]}' for key in ('LINT_OUTCOME','TYPE_OUTCOME','TEST_OUTCOME'))
-          git('commit', '-m', 'fix: implement ingestion audit follow-up corrections', '-m', 'Preserve caller data and bytes, verify complete aggregate storage on retries, keep UTC dates, decode MIME comments, allocate counts exactly, and protect JSON/CSV history and failure samples.\n\nValidation run: ' + os.environ['GITHUB_SERVER_URL'] + '/' + os.environ['GITHUB_REPOSITORY'] + '/actions/runs/' + os.environ['GITHUB_RUN_ID'] + '\n' + statuses + '\n\nAuthority: RFC 2045; Python mailbox.get_bytes, os.replace and datetime documentation; Elasticsearch/OpenSearch real-time multi-get APIs. See regression-test docstrings for specific invariants.\n\nThis is an isolated candidate; it is not automatically promoted to the ingestion branch.')
-          branch = 'codex/ingestion-candidate-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT']
-          git('push', 'origin', 'HEAD:refs/heads/' + branch)
-          sha = git('rev-parse', 'HEAD')
-          print('CANDIDATE_BRANCH=' + branch)
-          print('CANDIDATE_SHA=' + sha)
-          print(statuses)
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-              summary.write(f'Candidate `{branch}` at `{sha}`\n\n{statuses}\n')
-          PY
-      - name: Require all checks to pass
+          python -m hatch build
+          python -m sphinx -q -b html docs/source "$RUNNER_TEMP/parsedmarc-docs"
+  live-search:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: validation-tools
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          path: repository
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Start disposable local search services
+        run: |
+          sudo sysctl -w vm.max_map_count=262144
+          docker run --rm -d --name ingestion-elastic -p 127.0.0.1:9200:9200 -e discovery.type=single-node -e xpack.security.enabled=false -e ES_JAVA_OPTS='-Xms512m -Xmx512m' docker.elastic.co/elasticsearch/elasticsearch:8.19.7
+          docker run --rm -d --name ingestion-opensearch -p 127.0.0.1:9201:9200 -e discovery.type=single-node -e DISABLE_INSTALL_DEMO_CONFIG=true -e DISABLE_SECURITY_PLUGIN=true -e OPENSEARCH_JAVA_OPTS='-Xms512m -Xmx512m' opensearchproject/opensearch:2.19.0
+          for port in 9200 9201; do
+            ready=false
+            for attempt in $(seq 1 90); do
+              if curl -fs "http://127.0.0.1:$port/_cluster/health" > /tmp/health.json; then ready=true; break; fi
+              sleep 2
+            done
+            $ready || exit 1
+          done
+      - name: Install runtime integrations
+        working-directory: repository
+        run: python -m pip install -q -e '.[elastic,opensearch]'
+      - name: Live partial-save, lost-acknowledgment, legacy-row and timezone checks
+        working-directory: repository
+        run: python ../validation-tools/.github/ingestion-validation/live_search.py
+      - name: Remove disposable services
         if: always()
-        env:
-          LINT_OUTCOME: ${{ steps.lint.outcome }}
-          TYPE_OUTCOME: ${{ steps.types.outcome }}
-          TEST_OUTCOME: ${{ steps.tests.outcome }}
-        run: |
-          test "$LINT_OUTCOME" = success
-          test "$TYPE_OUTCOME" = success
-          test "$TEST_OUTCOME" = success
+        run: docker rm -f ingestion-elastic ingestion-opensearch || true
