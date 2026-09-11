@@ -1,0 +1,130 @@
+name: Ingestion fixes validation
+on:
+  push:
+    branches: [codex/ingestion-fixes-validation-20260911]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: validation-tools
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: 782f37e0669c099ead5c35a046fb4001c9a93619
+          path: repository
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Verify and apply reviewed bundle
+        id: apply
+        run: |
+          python - <<'PY'
+          import base64, hashlib, io, json, os, subprocess, zipfile
+          from pathlib import Path
+          tools = Path('validation-tools/.github/ingestion-validation')
+          parts = [(tools / f'part{i}.b64').read_text().strip() for i in range(1, 6)]
+          assert len(parts[3]) == 8831
+          fragment = 'byVoF/1amqu8pVW9yC7ualFvFd0e2ErESdZX3bqipTour3a9VONnUrtqrqi0pBnCLH0iKTJTOczoSuWfECu0NFweqrW8i8VlgJUzhtW7Vpld4lkx9gmewgWlnl9R4sK7l3ehCHVvVa5TNRgUsrckWmyAWE6Fol6aPUomlrWKH'
+          parts[3] = parts[3][:270] + fragment + parts[3][270:]
+          data = base64.b64decode(''.join(parts), validate=True)
+          assert hashlib.sha256(data).hexdigest() == '0a3a1ffffecfb42fb3f321a1d8acda6a531a9a0e58da369f452863cfa6c3b0eb'
+          bundle = Path(os.environ['RUNNER_TEMP']) / 'ingestion-fixes'
+          bundle.mkdir()
+          expected = {'changes.json', 'apply_fixes.py', 'new/parsedmarc/aggregate_storage.py', 'new/parsedmarc/output_storage.py', 'new/tests/test_aggregate_storage.py', 'new/tests/test_output_storage.py'}
+          with zipfile.ZipFile(io.BytesIO(data)) as z:
+              assert set(z.namelist()) == expected
+              z.extractall(bundle)
+          subprocess.run(['python', str(bundle / 'apply_fixes.py'), 'repository', '--apply'], check=True)
+          manifest = json.loads((bundle / 'changes.json').read_text())
+          paths = {e['path'] for e in manifest['edits']}
+          paths.update(p.relative_to(bundle / 'new').as_posix() for p in (bundle / 'new').rglob('*.py'))
+          (Path(os.environ['RUNNER_TEMP']) / 'changed-paths.json').write_text(json.dumps(sorted(paths)))
+          PY
+      - name: Install system dependencies
+        run: |
+          sudo apt-get -q update
+          sudo apt-get -qy install libemail-outlook-message-perl
+      - name: Install project and validation dependencies
+        id: install
+        working-directory: repository
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[build,all,postgresql]'
+      - name: Format changed Python files
+        if: steps.install.outcome == 'success'
+        working-directory: repository
+        run: |
+          python - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          paths = json.loads((Path(os.environ['RUNNER_TEMP']) / 'changed-paths.json').read_text())
+          subprocess.run(['python', '-m', 'ruff', 'format', *[p for p in paths if p.endswith('.py')]], check=True)
+          PY
+      - name: Ruff checks
+        id: lint
+        continue-on-error: true
+        if: steps.install.outcome == 'success'
+        working-directory: repository
+        run: |
+          python -m ruff check .
+          python -m ruff format --check .
+      - name: Pyright
+        id: types
+        continue-on-error: true
+        if: steps.install.outcome == 'success'
+        working-directory: repository
+        run: python -m pyright
+      - name: Repository tests
+        id: tests
+        continue-on-error: true
+        if: steps.install.outcome == 'success'
+        working-directory: repository
+        run: python -m pytest --tb=short -q tests/
+      - name: Publish isolated candidate, never the target branch
+        if: always() && steps.apply.outcome == 'success'
+        working-directory: repository
+        env:
+          LINT_OUTCOME: ${{ steps.lint.outcome }}
+          TYPE_OUTCOME: ${{ steps.types.outcome }}
+          TEST_OUTCOME: ${{ steps.tests.outcome }}
+        run: |
+          python - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          paths = json.loads((Path(os.environ['RUNNER_TEMP']) / 'changed-paths.json').read_text())
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          assert git('rev-parse', 'HEAD') == '782f37e0669c099ead5c35a046fb4001c9a93619'
+          git('config', 'user.name', 'ChatGPT')
+          git('config', 'user.email', 'noreply@openai.com')
+          git('add', '--', *paths)
+          staged = set(git('diff', '--cached', '--name-only').splitlines())
+          assert staged and staged <= set(paths)
+          statuses = ', '.join(f'{key}={os.environ[key]}' for key in ('LINT_OUTCOME','TYPE_OUTCOME','TEST_OUTCOME'))
+          git('commit', '-m', 'fix: implement ingestion audit follow-up corrections', '-m', 'Preserve caller data and bytes, verify complete aggregate storage on retries, keep UTC dates, decode MIME comments, allocate counts exactly, and protect JSON/CSV history and failure samples.\n\nValidation run: ' + os.environ['GITHUB_SERVER_URL'] + '/' + os.environ['GITHUB_REPOSITORY'] + '/actions/runs/' + os.environ['GITHUB_RUN_ID'] + '\n' + statuses + '\n\nAuthority: RFC 2045; Python mailbox.get_bytes, os.replace and datetime documentation; Elasticsearch/OpenSearch real-time multi-get APIs. See regression-test docstrings for specific invariants.\n\nThis is an isolated candidate; it is not automatically promoted to the ingestion branch.')
+          branch = 'codex/ingestion-candidate-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT']
+          git('push', 'origin', 'HEAD:refs/heads/' + branch)
+          sha = git('rev-parse', 'HEAD')
+          print('CANDIDATE_BRANCH=' + branch)
+          print('CANDIDATE_SHA=' + sha)
+          print(statuses)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f'Candidate `{branch}` at `{sha}`\n\n{statuses}\n')
+          PY
+      - name: Require all checks to pass
+        if: always()
+        env:
+          LINT_OUTCOME: ${{ steps.lint.outcome }}
+          TYPE_OUTCOME: ${{ steps.types.outcome }}
+          TEST_OUTCOME: ${{ steps.tests.outcome }}
+        run: |
+          test "$LINT_OUTCOME" = success
+          test "$TYPE_OUTCOME" = success
+          test "$TEST_OUTCOME" = success
