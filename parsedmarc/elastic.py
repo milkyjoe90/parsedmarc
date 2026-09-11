@@ -24,6 +24,7 @@ from elasticsearch.dsl import (
 from elasticsearch.helpers import reindex
 
 from parsedmarc import InvalidFailureReport
+from parsedmarc.aggregate_storage import save_aggregate_documents
 from parsedmarc.log import logger
 from parsedmarc.utils import human_timestamp_to_datetime
 
@@ -944,8 +945,12 @@ def save_aggregate_report_to_elasticsearch(
     org_name = metadata["org_name"]
     report_id = metadata["report_id"]
     domain = aggregate_report["policy_published"]["domain"]
-    begin_date = human_timestamp_to_datetime(metadata["begin_date"], to_utc=True)
-    end_date = human_timestamp_to_datetime(metadata["end_date"], to_utc=True)
+    begin_date = human_timestamp_to_datetime(
+        metadata["begin_date"], to_utc=True, assume_utc=True
+    )
+    end_date = human_timestamp_to_datetime(
+        metadata["end_date"], to_utc=True, assume_utc=True
+    )
 
     org_name_query = Q(dict(match_phrase=dict(org_name=org_name)))  # type: ignore
     report_id_query = Q(dict(match_phrase=dict(report_id=report_id)))  # pyright: ignore[reportArgumentType]
@@ -959,7 +964,9 @@ def save_aggregate_report_to_elasticsearch(
         search_index = "dmarc_aggregate*"
     if index_prefix is not None:
         search_index = f"{index_prefix}{search_index}"
-    search = Search(index=search_index)
+    search = Search(index=search_index).params(
+        ignore_unavailable=True, allow_no_indices=True
+    )
     query = org_name_query & report_id_query & domain_query
     query = query & begin_date_query & end_date_query
     # elasticsearch.dsl's own docs recommend ``search.query = Q(...)``, but
@@ -969,20 +976,6 @@ def save_aggregate_report_to_elasticsearch(
     begin_date_human = begin_date.strftime("%Y-%m-%d %H:%M:%SZ")
     end_date_human = end_date.strftime("%Y-%m-%d %H:%M:%SZ")
 
-    try:
-        existing = search.execute()
-    except Exception as error_:
-        raise ElasticsearchError(
-            f"Elasticsearch's search for existing report error: {error_.__str__()}"
-        )
-
-    if len(existing) > 0:
-        raise AlreadySaved(
-            f"An aggregate report ID {report_id} from {org_name} about {domain} "
-            f"with a date range of {begin_date_human} UTC to {end_date_human} UTC already "
-            "exists in "
-            "Elasticsearch"
-        )
     published_policy = _PublishedPolicy(
         domain=aggregate_report["policy_published"]["domain"],
         adkim=aggregate_report["policy_published"]["adkim"],
@@ -996,6 +989,7 @@ def save_aggregate_report_to_elasticsearch(
         discovery_method=aggregate_report["policy_published"].get("discovery_method"),
     )
 
+    documents: list[Any] = []
     for record in aggregate_report["records"]:
         begin_date = human_timestamp_to_datetime(
             record["interval_begin"], to_utc=True, assume_utc=True
@@ -1085,10 +1079,24 @@ def save_aggregate_report_to_elasticsearch(
         create_indexes([index], index_settings)
         agg_doc.meta.index = index  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
 
-        try:
-            agg_doc.save()
-        except Exception as e:
-            raise ElasticsearchError(f"Elasticsearch error: {e.__str__()}")
+        documents.append(agg_doc)
+
+    try:
+        saved = save_aggregate_documents(
+            aggregate_report,
+            documents,
+            search.scan(),
+            connections.get_connection(),
+        )
+    except Exception as error:
+        raise ElasticsearchError(
+            f"Elasticsearch aggregate save failed: {error}"
+        ) from error
+    if not saved:
+        raise AlreadySaved(
+            f"All rows of aggregate report {report_id} from {org_name} about {domain} "
+            f"({begin_date_human} to {end_date_human} UTC) already exist in Elasticsearch"
+        )
 
 
 def save_failure_report_to_elasticsearch(

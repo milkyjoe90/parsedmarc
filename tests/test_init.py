@@ -3901,7 +3901,7 @@ class TestGetDmarcReportsFromMboxParallel(unittest.TestCase):
             with self.subTest(n_procs=n_procs):
                 with patch.object(
                     mailbox.mbox,
-                    "get_string",
+                    "get_bytes",
                     side_effect=parsedmarc.ParserError("mailbox read unavailable"),
                 ):
                     with self.assertRaisesRegex(
@@ -5816,43 +5816,35 @@ class TestAppendJson(unittest.TestCase):
             if os.path.exists(path):
                 os.remove(path)
 
-    def test_corrupt_existing_file_is_overwritten_cleanly(self):
-        """If the existing JSON file is corrupt (e.g. truncated by a
-        prior crash, or hit the pre-fix `append_json` bug), the
-        read-merge-write path falls back to overwriting with the new
-        content rather than silently failing to record.
+    def test_corrupt_existing_file_is_retained_for_recovery(self):
+        """A partial old array must not disappear when a later batch arrives."""
+        import tempfile
+        from pathlib import Path
 
-        Recording at the cost of losing prior corrupt data is the
-        lesser evil — those bytes are already unparseable, so no
-        downstream consumer can read them anyway."""
-        with NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
-            tf.write("{ this is not valid json at all")
-            path = tf.name
-        try:
-            parsedmarc.append_json(path, cast(list[AggregateReport], [{"new": "data"}]))
-            with open(path) as f:
-                data = json.loads(f.read())
-            self.assertEqual(data, [{"new": "data"}])
-        finally:
-            if os.path.exists(path):
-                os.remove(path)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "aggregate.json"
+            original = b'[{"report_id": "historical"}'
+            path.write_bytes(original)
+            with self.assertRaises(ValueError):
+                parsedmarc.append_json(
+                    str(path), cast(list[AggregateReport], [{"a": 1}])
+                )
+            self.assertEqual(path.read_bytes(), original)
 
-    def test_existing_file_with_non_list_root_is_overwritten(self):
-        """If the existing file parses cleanly but the root isn't a
-        list (e.g. someone wrote {"foo": 1} by hand), the
-        isinstance(loaded, list) guard kicks in and we overwrite
-        rather than concatenating a dict and a list."""
-        with NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
-            tf.write('{"not": "a list"}')
-            path = tf.name
-        try:
-            parsedmarc.append_json(path, cast(list[AggregateReport], [{"new": "data"}]))
-            with open(path) as f:
-                data = json.loads(f.read())
-            self.assertEqual(data, [{"new": "data"}])
-        finally:
-            if os.path.exists(path):
-                os.remove(path)
+    def test_existing_non_array_history_is_preserved(self):
+        """An unexpected JSON root is not permission to erase prior data."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "aggregate.json"
+            original = b'{"not": "a list"}'
+            path.write_bytes(original)
+            with self.assertRaisesRegex(ValueError, "Expected a JSON array"):
+                parsedmarc.append_json(
+                    str(path), cast(list[AggregateReport], [{"new": "data"}])
+                )
+            self.assertEqual(path.read_bytes(), original)
 
 
 class TestAppendCsv(unittest.TestCase):
@@ -6470,6 +6462,47 @@ class TestSaveOutput(unittest.TestCase):
                 )
         return sorted(written)
 
+    def test_same_subject_in_later_batch_does_not_overwrite_sample(self):
+        first = self._failure_report("same subject")
+        second = self._failure_report("same subject")
+        second["sample"] += "Different message body."
+        self._save(first)
+        self._save(second)
+        expected = {
+            "same subject.eml": first["sample"],
+            "same subject (1).eml": second["sample"],
+        }
+        for name, contents in expected.items():
+            with open(
+                os.path.join(self.output_directory, "samples", name),
+                encoding="utf-8",
+                newline="",
+            ) as sample_file:
+                self.assertEqual(sample_file.read(), contents)
+
+    def test_result_zip_has_unique_safe_paths_and_no_lock_artifacts(self):
+        import io
+        import zipfile
+        from pathlib import PurePosixPath
+
+        results: ParsingResults = {
+            "aggregate_reports": [],
+            "failure_reports": [self._failure_report("sample")],
+            "smtp_tls_reports": [],
+        }
+        with zipfile.ZipFile(io.BytesIO(parsedmarc.get_report_zip(results))) as archive:
+            names = archive.namelist()
+            self.assertEqual(len(names), len(set(names)))
+            self.assertIn("samples/sample.eml", names)
+            self.assertFalse(any(name.endswith(".lock") for name in names))
+            self.assertTrue(
+                all(
+                    not PurePosixPath(name).is_absolute()
+                    and ".." not in PurePosixPath(name).parts
+                    for name in names
+                )
+            )
+
     def testTraversalSubjectsAreConfinedToTheSamplesDirectory(self):
         """Subjects made only of path separators and dots all collapse to
         the "sample" fallback inside samples/, instead of escaping it.
@@ -6566,3 +6599,218 @@ class TestSaveOutput(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestIngestionReliabilityFollowup(unittest.TestCase):
+    """Real parser/mbox regressions; no mocks of parsedmarc parsing helpers."""
+
+    def _xml(self, report_id="followup"):
+        from pathlib import Path
+
+        return (
+            Path("samples/aggregate/rfc9990-sample.xml")
+            .read_bytes()
+            .replace(b"3v98abbp8ya9n3va8yr8oa3ya", report_id.encode("ascii"))
+        )
+
+    @staticmethod
+    def _mime(data, subtype="xml"):
+        from email.mime.application import MIMEApplication
+
+        message = MIMEApplication(data, subtype)
+        message["Subject"] = "Ingestion regression"
+        message["From"] = "reporter@example.net"
+        message["Date"] = "Fri, 11 Sep 2026 00:00:00 +0000"
+        return message.as_bytes()
+
+    @staticmethod
+    def _write_mbox(path, messages):
+        # Write the bytes as stored, without reserializing a binary MIME body.
+        with open(path, "wb") as output:
+            for message in messages:
+                output.write(b"From reporter@example.net Fri Sep 11 00:00:00 2026\n")
+                output.write(message)
+                output.write(b"\n\n")
+
+    def test_bad_tls_and_archives_leave_other_mbox_reports_intact(self):
+        import gzip
+        import tempfile
+        from pathlib import Path
+        from parsedmarc.config import ParserConfig
+
+        bad_inputs = (
+            self._mime(b'{"not-a-report":true}', "tlsrpt+json"),
+            self._mime(gzip.compress(self._xml())[:-8], "gzip"),
+            self._mime(b"PK\x03\x04not-a-zip-file", "zip"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "reports.mbox"
+            for workers in (1, 2):
+                for bad in bad_inputs:
+                    with self.subTest(workers=workers, bad=bad[-24:]):
+                        self._write_mbox(
+                            path,
+                            [
+                                self._mime(self._xml("before")),
+                                bad,
+                                self._mime(self._xml("after")),
+                            ],
+                        )
+                        before = path.read_bytes()
+                        config = ParserConfig(offline=True)
+                        result = parsedmarc.get_dmarc_reports_from_mbox(
+                            str(path), config=config, n_procs=workers
+                        )
+                        reports = result["aggregate_reports"]
+                        self.assertEqual(
+                            [r["report_metadata"]["report_id"] for r in reports],
+                            ["before", "after"],
+                        )
+                        self.assertEqual(
+                            sum(row["count"] for r in reports for row in r["records"]),
+                            246,
+                        )
+                        self.assertEqual(path.read_bytes(), before)
+                        self.assertEqual(len(config.seen_aggregate_report_ids), 2)
+
+    def test_binary_gzip_survives_both_mbox_paths(self):
+        import gzip
+        import tempfile
+        from pathlib import Path
+        from parsedmarc.config import ParserConfig
+
+        message = (
+            b"From: reporter@example.net\nSubject: Binary report\n"
+            b"Date: Fri, 11 Sep 2026 00:00:00 +0000\n"
+            b"MIME-Version: 1.0\nContent-Type: application/gzip\n"
+            b"Content-Transfer-Encoding: binary\n\n"
+            + gzip.compress(self._xml("binary"))
+        )
+        expected = parsedmarc.parse_report_email(message, offline=True)["report"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "binary.mbox"
+            self._write_mbox(path, [message, self._mime(self._xml("other"))])
+            before = path.read_bytes()
+            for workers in (1, 2):
+                with self.subTest(workers=workers):
+                    result = parsedmarc.get_dmarc_reports_from_mbox(
+                        str(path), config=ParserConfig(offline=True), n_procs=workers
+                    )
+                    self.assertEqual(result["aggregate_reports"][0], expected)
+                    self.assertEqual(len(result["aggregate_reports"]), 2)
+                    self.assertEqual(path.read_bytes(), before)
+
+    def test_mbox_io_failure_does_not_commit_pending_keys(self):
+        import mailbox
+        import tempfile
+        from pathlib import Path
+        from parsedmarc.config import ParserConfig
+
+        read = mailbox.mbox.get_bytes
+
+        def fail_second(box, key, *args, **kwargs):
+            if key == 1:
+                raise OSError("storage unavailable")
+            return read(box, key, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "io.mbox"
+            self._write_mbox(
+                path, [self._mime(self._xml("first")), self._mime(self._xml("second"))]
+            )
+            for workers in (1, 2):
+                config = ParserConfig(offline=True)
+                with (
+                    self.subTest(workers=workers),
+                    patch.object(mailbox.mbox, "get_bytes", fail_second),
+                ):
+                    with self.assertRaisesRegex(OSError, "storage unavailable"):
+                        parsedmarc.get_dmarc_reports_from_mbox(
+                            str(path), config=config, n_procs=workers
+                        )
+                self.assertEqual(len(config.seen_aggregate_report_ids), 0)
+                # A subsequent retry must return the first report as well.
+                result = parsedmarc.get_dmarc_reports_from_mbox(
+                    str(path), config=config, n_procs=workers
+                )
+                self.assertEqual(len(result["aggregate_reports"]), 2)
+
+    def test_missing_mbox_is_not_silently_created(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing.mbox"
+            with self.assertRaises(parsedmarc.InvalidDMARCReport):
+                parsedmarc.get_dmarc_reports_from_mbox(str(path), offline=True)
+            self.assertFalse(path.exists())
+
+    def test_decompression_limit_has_invalid_content_type(self):
+        import gzip
+
+        # Exercise the fixed hard limit without allocating a 100 MiB test body.
+        with patch.object(parsedmarc, "MAX_DECOMPRESSED_REPORT_SIZE", 128):
+            with self.assertRaises(parsedmarc.InvalidReportArchive):
+                parsedmarc.parse_report_email(
+                    self._mime(gzip.compress(b"x" * 129), "gzip"), offline=True
+                )
+
+    def test_failure_sample_transfer_comments_are_semantically_ignored(self):
+        import email
+
+        for value in (
+            "quoted-printable",
+            "quoted-printable (gateway)",
+            "quoted-printable\n (gateway (nested))",
+        ):
+            with self.subTest(value=value):
+                part = email.message_from_string(
+                    "Content-Type: text/rfc822-headers; charset=utf-8\n"
+                    "Content-Transfer-Encoding: " + value + "\n\nSubject: caf=C3=A9\n"
+                )
+                original = part.as_string()
+                fallback = part.get_payload()
+                assert isinstance(fallback, str)
+                result = parsedmarc._decode_mime_payload(part, fallback)
+                self.assertEqual(result, "Subject: café\n")
+                self.assertEqual(part.as_string(), original)
+
+    def test_large_normalized_counts_are_exact(self):
+        from datetime import datetime, timedelta, timezone
+
+        begin = datetime(2026, 7, 1, 6, 0, 0, 1, tzinfo=timezone.utc)
+        for count in (1, 7, 2**53 + 1, 2**63 - 1, 10**40):
+            for span in (timedelta(hours=48), timedelta(days=7, microseconds=3)):
+                with self.subTest(count=count, span=span):
+                    rows = parsedmarc._bucket_interval_by_day(
+                        begin, begin + span, count
+                    )
+                    self.assertEqual(sum(row["count"] for row in rows), count)
+                    self.assertTrue(
+                        all(
+                            isinstance(row["count"], int) and row["count"] > 0
+                            for row in rows
+                        )
+                    )
+
+    def test_save_output_identical_retry_keeps_json_and_csv_in_step(self):
+        import csv
+        import json
+        import tempfile
+        from pathlib import Path
+
+        report = parsedmarc.parse_aggregate_report_xml(self._xml(), offline=True)
+        results: ParsingResults = {
+            "aggregate_reports": [report],
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            parsedmarc.save_output(results, output_directory=directory)
+            parsedmarc.save_output(results, output_directory=directory)
+            reports = json.loads((Path(directory) / "aggregate.json").read_text())
+            with (Path(directory) / "aggregate.csv").open(newline="") as source:
+                rows = list(csv.DictReader(source))
+            self.assertEqual(len(reports), 1)
+            self.assertEqual(len(rows), len(report["records"]))
+            self.assertEqual(sum(int(row["count"]) for row in rows), 123)

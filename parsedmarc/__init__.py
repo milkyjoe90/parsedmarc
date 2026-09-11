@@ -28,9 +28,10 @@ import zlib
 from base64 import b64decode
 from collections import deque
 from collections.abc import Callable, Sequence
+from contextlib import closing
 from copy import deepcopy
 from csv import DictWriter
-from datetime import date, datetime, timedelta, timezone, tzinfo
+from datetime import date, datetime, timedelta, timezone
 from email.policy import default as default_email_policy
 from io import BytesIO, StringIO
 from typing import (
@@ -46,6 +47,7 @@ from expiringdict import ExpiringDict
 from mailsuite.smtp import send_email
 from tqdm import tqdm
 
+from parsedmarc.aggregate_storage import AggregateReportKey, aggregate_report_key
 from parsedmarc.config import (
     IP_ADDRESS_CACHE,
     REVERSE_DNS_MAP,
@@ -64,6 +66,12 @@ from parsedmarc.mail import (
     MailboxConnection,
     MaildirConnection,
     MSGraphConnection,
+)
+from parsedmarc.output_storage import (
+    append_csv_file,
+    append_json_file,
+    save_json_csv_pair,
+    write_sample_file,
 )
 from parsedmarc.types import (
     AggregateReport,
@@ -167,6 +175,10 @@ EMAIL_SAMPLE_CONTENT_TYPES = (
 
 class ParserError(RuntimeError):
     """Raised whenever the parser fails for some reason"""
+
+
+class InvalidReportArchive(ParserError):
+    """A corrupt, unsupported, truncated or over-limit report attachment."""
 
 
 class InvalidDMARCReport(ParserError):
@@ -303,138 +315,55 @@ def _bucket_interval_by_day(
     end: datetime,
     total_count: int,
 ) -> list[dict[str, Any]]:
+    """Allocate a count across daily intervals without floating-point rounding.
+
+    Integer microsecond overlaps and divmod implement largest-remainder
+    allocation. Counts remain non-negative and sum exactly to total_count,
+    including integers beyond the exact range of a float. Calendar boundaries
+    and the existing 366-day implementation limit are unchanged.
     """
-    Split the interval [begin, end) into daily buckets and distribute
-    `total_count` proportionally across those buckets.
-
-    The function:
-      1. Identifies each calendar day touched by [begin, end)
-      2. Computes how many seconds of the interval fall into each day
-      3. Assigns counts in proportion to those overlaps
-      4. Ensures the final counts sum exactly to total_count
-
-    Args:
-        begin: timezone-aware datetime, inclusive start of interval
-        end: timezone-aware datetime, exclusive end of interval
-        total_count: number of messages to distribute
-
-    Returns:
-        A list of dicts like:
-            {
-                "begin": datetime,
-                "end": datetime,
-                "count": int
-            }
-    """
-    # --- Input validation ----------------------------------------------------
-    if begin > end:
-        raise ValueError("begin must be earlier than end")
     if begin.tzinfo is None or end.tzinfo is None:
         raise ValueError("begin and end must be timezone-aware")
     if begin.tzinfo is not end.tzinfo:
         raise ValueError("begin and end must have the same tzinfo")
+    if begin > end:
+        raise ValueError("begin must be earlier than end")
     if total_count < 0:
         raise ValueError("total_count must be non-negative")
 
-    # --- Short-circuit trivial cases -----------------------------------------
-    interval_seconds = (end - begin).total_seconds()
-    if interval_seconds > _MAX_AGGREGATE_SPAN_SECONDS:
+    def microseconds(value: timedelta) -> int:
+        return ((value.days * 86400 + value.seconds) * 1_000_000) + value.microseconds
+
+    interval = end - begin
+    if interval > timedelta(seconds=_MAX_AGGREGATE_SPAN_SECONDS):
         raise ValueError("Aggregate reporting period exceeds the 366-day safety limit")
-    if interval_seconds <= 0 or total_count == 0:
+    duration = microseconds(interval)
+    if duration <= 0 or total_count == 0:
         return []
 
-    tz: tzinfo = begin.tzinfo
+    cursor = datetime(begin.year, begin.month, begin.day, tzinfo=begin.tzinfo)
+    overlaps: list[tuple[datetime, datetime, int]] = []
+    while cursor < end:
+        # There is no representable midnight after 9999-12-31.
+        boundary = end if cursor.date() == date.max else cursor + timedelta(days=1)
+        overlap_begin = max(begin, cursor)
+        overlap_end = min(end, boundary)
+        weight = microseconds(overlap_end - overlap_begin)
+        if weight > 0:
+            overlaps.append((overlap_begin, overlap_end, weight))
+        cursor = boundary
 
-    # --- Step 1: Determine all calendar days touched by [begin, end) ----------
-    #
-    # For example:
-    #   begin = Jan 1 12:00
-    #   end   = Jan 3 06:00
-    #
-    # We need buckets for:
-    #   Jan 1 12:00 → Jan 2 00:00
-    #   Jan 2 00:00 → Jan 3 00:00
-    #   Jan 3 00:00 → Jan 3 06:00
-    #
-
-    # Start at midnight on the day of `begin`.
-    day_cursor = datetime(begin.year, begin.month, begin.day, tzinfo=tz)
-
-    # If `begin` is earlier on that day (e.g. 10:00), we want that midnight.
-    # If `begin` is past that midnight (e.g. 00:30), this is correct.
-    # If `begin` is BEFORE that midnight (rare unless tz shifts), adjust:
-    if day_cursor > begin:
-        day_cursor -= timedelta(days=1)
-
-    day_buckets: list[dict[str, Any]] = []
-
-    while day_cursor < end:
-        day_start = day_cursor
-        day_end = day_cursor + timedelta(days=1)
-
-        # Overlap between [begin, end) and this day
-        overlap_start = max(begin, day_start)
-        overlap_end = min(end, day_end)
-
-        overlap_seconds = (overlap_end - overlap_start).total_seconds()
-
-        if overlap_seconds > 0:
-            day_buckets.append(
-                {
-                    "begin": overlap_start,
-                    "end": overlap_end,
-                    "seconds": overlap_seconds,
-                }
-            )
-
-        day_cursor = day_end
-
-    # --- Step 2: Pro-rate counts across buckets -------------------------------
-    #
-    # Compute the exact fractional count for each bucket:
-    #     bucket_fraction = bucket_seconds / interval_seconds
-    #     bucket_exact    = total_count * bucket_fraction
-    #
-    # Then apply a "largest remainder" rounding strategy to ensure the sum
-    # equals exactly total_count.
-
-    exact_values: list[float] = [
-        (b["seconds"] / interval_seconds) * total_count for b in day_buckets
+    quotients = [divmod(total_count * weight, duration) for _, _, weight in overlaps]
+    counts = [quotient for quotient, _ in quotients]
+    remaining = total_count - sum(counts)
+    order = sorted(range(len(overlaps)), key=lambda i: quotients[i][1], reverse=True)
+    for index in order[:remaining]:
+        counts[index] += 1
+    return [
+        {"begin": start, "end": finish, "count": count}
+        for (start, finish, _), count in zip(overlaps, counts)
+        if count > 0
     ]
-
-    floor_values: list[int] = [int(x) for x in exact_values]
-    fractional_parts: list[float] = [x - int(x) for x in exact_values]
-
-    # How many counts do we still need to distribute after flooring?
-    remainder = total_count - sum(floor_values)
-
-    # Sort buckets by descending fractional remainder
-    indices_by_fraction = sorted(
-        range(len(day_buckets)),
-        key=lambda i: fractional_parts[i],
-        reverse=True,
-    )
-
-    # Start with floor values
-    final_counts = floor_values[:]
-
-    # Add +1 to the buckets with the largest fractional parts
-    for idx in indices_by_fraction[:remainder]:
-        final_counts[idx] += 1
-
-    # --- Step 3: Build the final per-day result list -------------------------
-    results: list[dict[str, Any]] = []
-    for bucket, count in zip(day_buckets, final_counts):
-        if count > 0:
-            results.append(
-                {
-                    "begin": bucket["begin"],
-                    "end": bucket["end"],
-                    "count": count,
-                }
-            )
-
-    return results
 
 
 def _append_parsed_record(
@@ -1326,7 +1255,9 @@ def _decompress_gzip_bounded(data: bytes) -> bytes:
     decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
     decompressed = decompressor.decompress(data, max_length=limit + 1)
     if len(decompressed) > limit:
-        raise ParserError(f"Decompressed report exceeds the {limit} byte limit")
+        raise InvalidReportArchive(
+            f"Decompressed report exceeds the {limit} byte limit"
+        )
     # ``flush()`` ignores ``max_length``, so it must not run until the
     # bounded read above has been accepted. It is bounded here: a bounded
     # ``decompress()`` that returns fewer than ``max_length`` bytes has
@@ -1337,7 +1268,7 @@ def _decompress_gzip_bounded(data: bytes) -> bytes:
     if not decompressor.eof:
         # A one-shot zlib.decompress() raises on a stream that ends early;
         # a decompressobj just stops, so the truncation is detected here.
-        raise ParserError("Incomplete or truncated gzip stream")
+        raise InvalidReportArchive("Incomplete or truncated gzip stream")
 
     return decompressed
 
@@ -1399,11 +1330,22 @@ def extract_report(content: bytes | str | BinaryIO) -> str:
                 file_object = BytesIO(header + bytes(remainder))
 
         if header[: len(MAGIC_ZIP)] == MAGIC_ZIP:
-            _zip = zipfile.ZipFile(file_object)
-            limit = MAX_DECOMPRESSED_REPORT_SIZE
-            member = _zip.open(_zip.namelist()[0]).read(limit + 1)
+            with zipfile.ZipFile(file_object) as archive:
+                members = [info for info in archive.infolist() if not info.is_dir()]
+                if not members:
+                    raise InvalidReportArchive("Report ZIP archive has no file members")
+                info = members[0]
+                if info.flag_bits & 1:
+                    raise InvalidReportArchive(
+                        "Encrypted report ZIP archives are not supported"
+                    )
+                limit = MAX_DECOMPRESSED_REPORT_SIZE
+                with archive.open(info) as stream:
+                    member = stream.read(limit + 1)
             if len(member) > limit:
-                raise ParserError(f"Decompressed report exceeds the {limit} byte limit")
+                raise InvalidReportArchive(
+                    f"Decompressed report exceeds the {limit} byte limit"
+                )
             report = member.decode(errors="ignore")
         elif header[: len(MAGIC_GZIP)] == MAGIC_GZIP:
             report = _decompress_gzip_bounded(file_object.read()).decode(
@@ -1416,11 +1358,16 @@ def extract_report(content: bytes | str | BinaryIO) -> str:
         ):
             report = file_object.read().decode(errors="ignore")
         else:
-            raise ParserError("Not a valid zip, gzip, json, or xml file")
+            raise InvalidReportArchive("Not a valid zip, gzip, json, or xml file")
 
+    except InvalidReportArchive:
+        raise
+    except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError) as error:
+        raise InvalidReportArchive(f"Invalid archive file: {error}") from error
     except Exception as error:
+        # A file read or another operational failure is not invalid input.
         raise ParserError(
-            f"Invalid archive file: {error.__str__()}{_exc_origin(error)}"
+            f"Unable to read report content: {error}{_exc_origin(error)}"
         ) from error
     finally:
         if file_object:
@@ -2078,6 +2025,24 @@ def parsed_failure_reports_to_csv(
     return csv_file.getvalue()
 
 
+def _content_transfer_encoding(part: email.message.Message) -> str | None:
+    """Return a recognized CTE token, including legal folding and CFWS."""
+    raw = part.get("Content-Transfer-Encoding") or ""
+    if not raw:
+        return ""
+    header = default_email_policy.header_fetch_parse("Content-Transfer-Encoding", raw)
+    if header.defects or not isinstance(
+        header, email.headerregistry.ContentTransferEncodingHeader
+    ):
+        return None
+    token = header.cte
+    return (
+        token
+        if token in ("7bit", "8bit", "binary", "base64", "quoted-printable")
+        else None
+    )
+
+
 def _decode_mime_payload(part: email.message.Message, fallback: str) -> str:
     """
     Returns a MIME part's payload decoded per its ``Content-Transfer-Encoding``
@@ -2118,9 +2083,12 @@ def _decode_mime_payload(part: email.message.Message, fallback: str) -> str:
         str: The decoded payload
     """
     try:
-        cte = (part.get("Content-Transfer-Encoding") or "").strip().lower()
+        cte = _content_transfer_encoding(part)
         if cte not in ("quoted-printable", "base64"):
             return fallback
+        if part.get("Content-Transfer-Encoding") != cte:
+            part = deepcopy(part)
+            part.replace_header("Content-Transfer-Encoding", cte)
 
         payload_bytes = part.get_payload(decode=True)
         if isinstance(payload_bytes, bytes):
@@ -2174,19 +2142,8 @@ def _decode_report_attachment(
     if part.is_multipart():
         return None
     raw_cte = part.get("Content-Transfer-Encoding") or ""
-    cte = ""
-    if raw_cte:
-        # RFC 2045 section 1 allows comments in MIME headers. The public
-        # fetch parser unfolds the value before the header registry handles
-        # CFWS, including nested comments.
-        header = default_email_policy.header_fetch_parse(
-            "Content-Transfer-Encoding", raw_cte
-        )
-        if header.defects:
-            return None
-        assert isinstance(header, email.headerregistry.ContentTransferEncodingHeader)
-        cte = header.cte
-    if cte not in ("", "7bit", "8bit", "binary", "base64", "quoted-printable"):
+    cte = _content_transfer_encoding(part)
+    if cte is None:
         return None
     if preserve_bytes or cte in ("base64", "quoted-printable"):
         if raw_cte and raw_cte != cte:
@@ -2408,6 +2365,11 @@ def parse_report_email(
                 # by the specific parser exceptions below.
                 pass
 
+            except InvalidReportArchive as e:
+                raise InvalidReportArchive(
+                    f'Message with subject "{subject}" contains an invalid report archive: {e}'
+                ) from e
+
             except InvalidDMARCReport as e:
                 error = (
                     f'Message with subject "{subject}" is not a valid DMARC report: {e}'
@@ -2617,23 +2579,9 @@ def parse_report_file(
     return results
 
 
-def _aggregate_report_key(report: AggregateReport) -> tuple[str, str, str, str]:
-    """Scope a full Report-ID to its reporting organization and policy domain.
-
-    RFC 9990 section 3.5.1 permits an optional surrounding pair of angle
-    brackets and an @ suffix. Normalize only that syntactic wrapper for
-    deduplication; the parsed metadata retains the reporter's full value.
-    """
-    metadata = report["report_metadata"]
-    report_id = metadata["report_id"]
-    if report_id.startswith("<") and report_id.endswith(">"):
-        report_id = report_id[1:-1]
-    return (
-        metadata["org_name"],
-        metadata["org_email"],
-        report["policy_published"]["domain"].lower(),
-        report_id,
-    )
+def _aggregate_report_key(report: AggregateReport) -> AggregateReportKey:
+    """Return the canonical identity shared with persistent aggregate storage."""
+    return aggregate_report_key(report)
 
 
 def _classify_parsed_email(
@@ -2643,7 +2591,7 @@ def _classify_parsed_email(
     smtp_tls_reports: list[SMTPTLSReport],
     *,
     seen_aggregate_report_ids: ExpiringDict,
-    pending_aggregate_keys: set[tuple[str, str, str, str]] | None = None,
+    pending_aggregate_keys: set[AggregateReportKey] | None = None,
 ) -> ReportType:
     """Classify a parsed report email, appending it to the matching list.
 
@@ -2817,58 +2765,63 @@ def get_dmarc_reports_from_mbox(
     aggregate_reports: list[AggregateReport] = []
     failure_reports: list[FailureReport] = []
     smtp_tls_reports: list[SMTPTLSReport] = []
+    pending_keys: set[AggregateReportKey] = set()
+    invalid_input = (InvalidDMARCReport, InvalidSMTPTLSReport, InvalidReportArchive)
     try:
-        mbox = mailbox.mbox(input_)
-        message_keys = mbox.keys()
-        total_messages = len(message_keys)
-        logger.debug(f"Found {total_messages} messages in {input_}")
+        with closing(mailbox.mbox(input_, create=False)) as mbox:
+            message_keys = mbox.keys()
+            total_messages = len(message_keys)
+            logger.debug(f"Found {total_messages} messages in {input_}")
 
-        if n_procs > 1 and total_messages > 1:
-            from parsedmarc.parallel import _parse_report_email_job, parallel_map
+            if n_procs > 1 and total_messages > 1:
+                from parsedmarc.parallel import _parse_report_email_job, parallel_map
 
-            func = functools.partial(_parse_report_email_job, config=cfg)
+                func = functools.partial(_parse_report_email_job, config=cfg)
 
-            def _jobs():
-                for i in range(total_messages):
-                    message_key = message_keys[i]
+                def _jobs():
+                    for i, message_key in enumerate(message_keys):
+                        logger.info(f"Processing message {i + 1} of {total_messages}")
+                        yield mbox.get_bytes(message_key)
+
+                for result in tqdm(
+                    parallel_map(func, _jobs(), n_procs),
+                    total=total_messages,
+                    disable=None,
+                ):
+                    if isinstance(result, invalid_input):
+                        logger.warning(str(result))
+                    elif isinstance(result, ParserError):
+                        raise result
+                    else:
+                        _classify_parsed_email(
+                            result,
+                            aggregate_reports,
+                            failure_reports,
+                            smtp_tls_reports,
+                            seen_aggregate_report_ids=cfg.seen_aggregate_report_ids,
+                            pending_aggregate_keys=pending_keys,
+                        )
+            else:
+                for i, message_key in enumerate(tqdm(message_keys, disable=None)):
                     logger.info(f"Processing message {i + 1} of {total_messages}")
-                    yield mbox.get_string(message_key)
+                    msg_content = mbox.get_bytes(message_key)
+                    try:
+                        parsed_email = parse_report_email(msg_content, config=cfg)
+                        _classify_parsed_email(
+                            parsed_email,
+                            aggregate_reports,
+                            failure_reports,
+                            smtp_tls_reports,
+                            seen_aggregate_report_ids=cfg.seen_aggregate_report_ids,
+                            pending_aggregate_keys=pending_keys,
+                        )
+                    except invalid_input as error:
+                        logger.warning(str(error))
+    except mailbox.NoSuchMailboxError as error:
+        raise InvalidDMARCReport(f"Mailbox {input_} does not exist") from error
 
-            for result in tqdm(
-                parallel_map(func, _jobs(), n_procs),
-                total=total_messages,
-                disable=None,
-            ):
-                if isinstance(result, InvalidDMARCReport):
-                    logger.warning(str(result))
-                elif isinstance(result, ParserError):
-                    raise result
-                else:
-                    _classify_parsed_email(
-                        result,
-                        aggregate_reports,
-                        failure_reports,
-                        smtp_tls_reports,
-                        seen_aggregate_report_ids=cfg.seen_aggregate_report_ids,
-                    )
-        else:
-            for i in tqdm(range(total_messages), disable=None):
-                message_key = message_keys[i]
-                logger.info(f"Processing message {i + 1} of {total_messages}")
-                msg_content = mbox.get_string(message_key)
-                try:
-                    parsed_email = parse_report_email(msg_content, config=cfg)
-                    _classify_parsed_email(
-                        parsed_email,
-                        aggregate_reports,
-                        failure_reports,
-                        smtp_tls_reports,
-                        seen_aggregate_report_ids=cfg.seen_aggregate_report_ids,
-                    )
-                except InvalidDMARCReport as error:
-                    logger.warning(error.__str__())
-    except mailbox.NoSuchMailboxError:
-        raise InvalidDMARCReport(f"Mailbox {input_} does not exist")
+    for report_key in pending_keys:
+        cfg.seen_aggregate_report_ids[report_key] = True
     return {
         "aggregate_reports": aggregate_reports,
         "failure_reports": failure_reports,
@@ -3127,7 +3080,7 @@ def get_dmarc_reports_from_mailbox(
     # cache once the batch is known to be saved, so an unsaved batch (or a
     # mid-batch crash) leaves the cache clean and the reports are reparsed
     # on the retry instead of being dropped as duplicates.
-    pending_aggregate_keys: set[tuple[str, str, str, str]] = set()
+    pending_aggregate_keys: set[AggregateReportKey] = set()
     aggregate_report_msg_uids = []
     failure_report_msg_uids = []
     smtp_tls_msg_uids = []
@@ -3661,50 +3614,26 @@ def append_json(
     reports: Sequence[AggregateReport]
     | Sequence[FailureReport]
     | Sequence[SMTPTLSReport],
+    *,
+    deduplicate: bool = False,
 ) -> None:
-    """Append ``reports`` to a JSON array on disk, creating the file
-    if needed.
+    """Atomically append a JSON array; never discard corrupt existing history.
 
-    Reads the existing array (if the file exists and parses cleanly),
-    merges the new reports onto the end, and rewrites the file as a
-    single valid JSON array. An earlier version of this used an
-    ``open(..., "a+")`` + ``seek()`` + overwrite pattern, but Python's
-    documentation is explicit that on POSIX, ``a`` / ``a+`` writes
-    *always* go to EOF regardless of seek position — so the second
-    call onto an existing file produced ``[...],\\n[...]``-style
-    corrupted output. Read-merge-write is the only way to get a valid
-    JSON array out of repeated appends.
+    The optional exact-payload replay check preserves multiplicity within a
+    supplied batch. The default retains the public append-only semantics.
     """
-    if len(reports) == 0:
-        # Don't create an empty-array file for an empty input; if a
-        # file already exists, leave it alone.
+    append_json_file(filename, reports, deduplicate=deduplicate)
+
+
+def append_csv(filename: str, csv: str, *, deduplicate: bool = False) -> None:
+    """Append CSV, or atomically merge exact replays at the output boundary."""
+    if deduplicate:
+        append_csv_file(filename, csv, deduplicate=True)
         return
-
-    existing: list = []
-    if os.path.isfile(filename) and os.path.getsize(filename) > 0:
-        try:
-            with open(filename, "r", encoding="utf-8") as f:
-                loaded = json.loads(f.read())
-            if isinstance(loaded, list):
-                existing = loaded
-        except (json.JSONDecodeError, OSError):
-            # Corrupted or unreadable: overwrite cleanly rather than
-            # silently fail to record.
-            existing = []
-
-    merged = existing + list(reports)
-    with open(filename, "w", newline="\n", encoding="utf-8") as output:
-        json.dump(merged, output, ensure_ascii=False, indent=2)
-
-
-def append_csv(filename: str, csv: str) -> None:
     with open(filename, "a+", newline="\n", encoding="utf-8") as output:
         if output.seek(0, os.SEEK_END) != 0:
-            # strip the headers from the CSV
             _headers, csv = csv.split("\n", 1)
             if len(csv) == 0:
-                # not appending anything, don't do any dance to
-                # append it correctly
                 return
         output.write(csv)
 
@@ -3720,131 +3649,78 @@ def save_output(
     failure_csv_filename: str = "failure.csv",
     smtp_tls_csv_filename: str = "smtp_tls.csv",
 ):
+    """Persist report output without truncating history or replacing samples.
+
+    JSON is the authoritative history and CSV is rebuilt from the full
+    report objects under paired advisory locks. Aggregate/TLS exact-payload
+    retries preserve within-batch multiplicity. Failure reports remain
+    at-least-once because they lack reliable unique IDs. This is not a
+    transaction across destinations: a later error must retain the input.
+
+    Failure sample subjects are sanitized at write time. A distinct sample
+    with an existing name gets a numeric suffix; an identical retry reuses
+    its existing file. Caller-supplied filename_safe_subject is never trusted.
+    Filename parameters retain their existing meaning and defaults.
     """
-    Save report data in the given directory
-
-    The message sample of each failure report is written to a ``samples``
-    subdirectory, named after the sample's own ``subject`` header run
-    through :func:`parsedmarc.utils.get_filename_safe_string`, falling back
-    to ``sample`` when sanitizing leaves nothing. Since a subject arrives
-    from an untrusted sender, sanitizing happens here, at write time; the
-    ``filename_safe_subject`` key a caller may supply alongside it is not
-    trusted and not used. Names that collide get a ``(1)``, ``(2)``, …
-    suffix.
-
-    Args:
-        results: Parsing results
-        output_directory (str): The path to the directory to save in
-        aggregate_json_filename (str): Filename for the aggregate JSON file
-        failure_json_filename (str): Filename for the failure JSON file
-        smtp_tls_json_filename (str): Filename for the SMTP TLS JSON file
-        aggregate_csv_filename (str): Filename for the aggregate CSV file
-        failure_csv_filename (str): Filename for the failure CSV file
-        smtp_tls_csv_filename (str): Filename for the SMTP TLS CSV file
-    """
-
     aggregate_reports = results["aggregate_reports"]
     failure_reports = results["failure_reports"]
     smtp_tls_reports = results["smtp_tls_reports"]
     output_directory = os.path.expanduser(output_directory)
+    if os.path.exists(output_directory) and not os.path.isdir(output_directory):
+        raise ValueError(f"{output_directory} is not a directory")
+    os.makedirs(output_directory, exist_ok=True)
 
-    if os.path.exists(output_directory):
-        if not os.path.isdir(output_directory):
-            raise ValueError(f"{output_directory} is not a directory")
-    else:
-        os.makedirs(output_directory)
-
-    append_json(
-        os.path.join(output_directory, aggregate_json_filename), aggregate_reports
-    )
-
-    append_csv(
+    save_json_csv_pair(
+        os.path.join(output_directory, aggregate_json_filename),
         os.path.join(output_directory, aggregate_csv_filename),
-        parsed_aggregate_reports_to_csv(aggregate_reports),
+        aggregate_reports,
+        parsed_aggregate_reports_to_csv,
+        deduplicate=True,
     )
-
-    append_json(os.path.join(output_directory, failure_json_filename), failure_reports)
-
-    append_csv(
+    save_json_csv_pair(
+        os.path.join(output_directory, failure_json_filename),
         os.path.join(output_directory, failure_csv_filename),
-        parsed_failure_reports_to_csv(failure_reports),
+        failure_reports,
+        parsed_failure_reports_to_csv,
+        deduplicate=False,
     )
-
-    append_json(
-        os.path.join(output_directory, smtp_tls_json_filename), smtp_tls_reports
-    )
-
-    append_csv(
+    save_json_csv_pair(
+        os.path.join(output_directory, smtp_tls_json_filename),
         os.path.join(output_directory, smtp_tls_csv_filename),
-        parsed_smtp_tls_reports_to_csv(smtp_tls_reports),
+        smtp_tls_reports,
+        parsed_smtp_tls_reports_to_csv,
+        deduplicate=True,
     )
 
     samples_directory = os.path.join(output_directory, "samples")
-    if not os.path.exists(samples_directory):
-        os.makedirs(samples_directory)
-
-    sample_filenames = []
+    os.makedirs(samples_directory, exist_ok=True)
     for failure_report in failure_reports:
-        sample = failure_report["sample"]
-        message_count = 0
-        parsed_sample = failure_report["parsed_sample"]
-        subject = get_filename_safe_string(parsed_sample.get("subject")) or "sample"
-        filename = subject
-
-        while filename in sample_filenames:
-            message_count += 1
-            filename = f"{subject} ({message_count})"
-
-        sample_filenames.append(filename)
-
-        filename = f"{filename}.eml"
-        path = os.path.join(samples_directory, filename)
-        with open(path, "w", newline="\n", encoding="utf-8") as sample_file:
-            sample_file.write(sample)
+        subject = (
+            get_filename_safe_string(failure_report["parsed_sample"].get("subject"))
+            or "sample"
+        )
+        write_sample_file(samples_directory, subject, failure_report["sample"])
 
 
 def get_report_zip(results: ParsingResults) -> bytes:
-    """
-    Creates a zip file of parsed report output
-
-    Args:
-        results: The parsed results
-
-    Returns:
-        bytes: zip file bytes
-    """
-
-    def add_subdir(root_path, subdir):
-        subdir_path = os.path.join(root_path, subdir)
-        for subdir_root, subdir_dirs, subdir_files in os.walk(subdir_path):
-            for subdir_file in subdir_files:
-                subdir_file_path = os.path.join(root_path, subdir, subdir_file)
-                if os.path.isfile(subdir_file_path):
-                    rel_path = os.path.relpath(subdir_root, subdir_file_path)
-                    subdir_arc_name = os.path.join(rel_path, subdir_file)
-                    zip_file.write(subdir_file_path, subdir_arc_name)
-            for subdir in subdir_dirs:
-                add_subdir(subdir_path, subdir)
-
+    """Create an output ZIP with unique, root-relative paths and no lock files."""
     storage = BytesIO()
     tmp_dir = tempfile.mkdtemp()
     try:
         save_output(results, output_directory=tmp_dir)
-        with zipfile.ZipFile(storage, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        with zipfile.ZipFile(storage, "w", zipfile.ZIP_DEFLATED) as archive:
             for root, dirs, files in os.walk(tmp_dir):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    if os.path.isfile(file_path):
-                        arcname = os.path.join(os.path.relpath(root, tmp_dir), file)
-                        zip_file.write(file_path, arcname)
-                for directory in dirs:
-                    dir_path = os.path.join(root, directory)
-                    if os.path.isdir(dir_path):
-                        zip_file.write(dir_path, directory)
-                        add_subdir(root, directory)
+                dirs.sort()
+                if root != tmp_dir:
+                    archive.write(root, os.path.relpath(root, tmp_dir))
+                for filename in sorted(files):
+                    if filename.startswith(".") and filename.endswith(".lock"):
+                        continue
+                    path = os.path.join(root, filename)
+                    if os.path.isfile(path):
+                        archive.write(path, os.path.relpath(path, tmp_dir))
     finally:
         shutil.rmtree(tmp_dir)
-
     return storage.getvalue()
 
 

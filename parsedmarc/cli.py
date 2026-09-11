@@ -3049,6 +3049,10 @@ def _main():
         or file_parsing_results["failure_reports"]
         or file_parsing_results["smtp_tls_reports"]
     )
+    file_aggregate_keys = {
+        _aggregate_report_key(report)
+        for report in file_parsing_results["aggregate_reports"]
+    }
     try:
         file_output_errors = (
             process_reports(file_parsing_results) if file_results_nonempty else []
@@ -3057,8 +3061,8 @@ def _main():
         logger.error(str(error))
         sys.exit(1)
     if not file_output_errors:
-        for report in file_parsing_results["aggregate_reports"]:
-            SEEN_AGGREGATE_REPORT_IDS[_aggregate_report_key(report)] = True
+        for report_key in file_aggregate_keys:
+            SEEN_AGGREGATE_REPORT_IDS[report_key] = True
         for file_path, result in files_pending_archive:
             _archive_processed_file(file_path, opts.archive_directory, result)
 
