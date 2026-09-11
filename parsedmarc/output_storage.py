@@ -18,7 +18,7 @@ import tempfile
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from typing import Any, TextIO
+from typing import IO, Any
 
 
 @contextmanager
@@ -52,7 +52,7 @@ def _output_lock(filename: str) -> Iterator[None]:
 
 
 @contextmanager
-def _atomic_text_file(filename: str) -> Iterator[TextIO]:
+def _atomic_text_file(filename: str) -> Iterator[IO[str]]:
     directory = os.path.dirname(os.path.abspath(filename))
     previous_mode: int | None = None
     try:
@@ -73,7 +73,7 @@ def _atomic_text_file(filename: str) -> Iterator[TextIO]:
             temporary_name = output.name
             if previous_mode is not None:
                 os.chmod(temporary_name, previous_mode)
-            yield output
+            yield output.file
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary_name, filename)

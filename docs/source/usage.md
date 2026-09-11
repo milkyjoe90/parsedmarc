@@ -1441,3 +1441,50 @@ journalctl -u parsedmarc.service -r
 [cloudflare's public resolvers]: https://1.1.1.1/
 [url encoded]: https://en.wikipedia.org/wiki/Percent-encoding#Percent-encoding_reserved_characters
 [ipinfo lite rest api]: https://ipinfo.io/developers/lite-api
+
+
+## Ingestion recovery and output history
+
+Local input files and aggregate duplicate keys are acknowledged only after
+all configured report outputs accept the batch. A failed output leaves the
+source available for retry. Mailbox retry limits and the `Unsaved` folder
+continue to apply. These guarantees are not a distributed transaction:
+destinations that already succeeded may receive the retry again.
+
+Elasticsearch and OpenSearch no longer consider a single matching aggregate
+row a complete report. Each expected row is reconciled using the reporting
+organization, contact email, policy domain and full Report-ID, plus the row
+contents and duplicate occurrence number. New rows use deterministic IDs;
+real-time multi-get checks avoid depending on search refresh timing. Matching
+legacy rows are reused without deleting or rewriting historical documents.
+Conflicting or unverifiable stored rows cause an output error and retain the
+source for investigation. This does not automatically repair reports that
+were partially saved and whose original inputs have already been removed.
+
+File output treats the JSON array as authoritative history and rebuilds its
+CSV view from complete report objects. JSON and CSV writes use temporary
+files and atomic replacement under advisory locks. Nonempty corrupt JSON,
+a non-array JSON root, and nonempty CSV without its JSON history are rejected
+rather than silently overwritten. Preserve both files when rotating or moving
+output history. To recover an inconsistent pair, back it up and restore or
+repair the JSON first; a subsequent successful save regenerates the CSV.
+Do not delete history merely to bypass a diagnostic.
+
+Exact aggregate and TLS payload replays are suppressed while duplicate
+multiplicity within an input batch is retained. Failure reports remain
+at-least-once: identical-looking failure events cannot safely be identified
+as duplicates without a durable source ID. A failure sample reuses an
+identical existing file, while different content with the same sanitized
+subject receives a numeric suffix instead of replacing the old file.
+
+File output requires a filesystem that supports the advisory locks used by
+the host and hard links for exclusive sample publication. Lock files are
+internal sidecars, not report data, and must not be removed while a writer
+is active. Files are flushed before replacement, but this is neither a
+multi-file transaction nor a guarantee against every power-loss scenario.
+JSON/CSV rewriting grows with accumulated history; rotate history as a pair
+or use a database output for sustained high-volume ingestion.
+
+Mbox imports preserve bytes, isolate known invalid report content and retain
+the original mbox unchanged. Operational failures still propagate, and an
+aborted import does not commit the pending aggregate duplicate keys.

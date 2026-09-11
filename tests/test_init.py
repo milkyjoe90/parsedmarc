@@ -5831,22 +5831,20 @@ class TestAppendJson(unittest.TestCase):
                 )
             self.assertEqual(path.read_bytes(), original)
 
-    def test_existing_file_with_non_list_root_is_overwritten(self):
-        """If the existing file parses cleanly but the root isn't a
-        list (e.g. someone wrote {"foo": 1} by hand), the
-        isinstance(loaded, list) guard kicks in and we overwrite
-        rather than concatenating a dict and a list."""
-        with NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
-            tf.write('{"not": "a list"}')
-            path = tf.name
-        try:
-            parsedmarc.append_json(path, cast(list[AggregateReport], [{"new": "data"}]))
-            with open(path) as f:
-                data = json.loads(f.read())
-            self.assertEqual(data, [{"new": "data"}])
-        finally:
-            if os.path.exists(path):
-                os.remove(path)
+    def test_existing_non_array_history_is_preserved(self):
+        """An unexpected JSON root is not permission to erase prior data."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "aggregate.json"
+            original = b'{"not": "a list"}'
+            path.write_bytes(original)
+            with self.assertRaisesRegex(ValueError, "Expected a JSON array"):
+                parsedmarc.append_json(
+                    str(path), cast(list[AggregateReport], [{"new": "data"}])
+                )
+            self.assertEqual(path.read_bytes(), original)
 
 
 class TestAppendCsv(unittest.TestCase):
@@ -6487,7 +6485,7 @@ class TestSaveOutput(unittest.TestCase):
         import zipfile
         from pathlib import PurePosixPath
 
-        results = {
+        results: ParsingResults = {
             "aggregate_reports": [],
             "failure_reports": [self._failure_report("sample")],
             "smtp_tls_reports": [],
@@ -6771,7 +6769,9 @@ class TestIngestionReliabilityFollowup(unittest.TestCase):
                     "Content-Transfer-Encoding: " + value + "\n\nSubject: caf=C3=A9\n"
                 )
                 original = part.as_string()
-                result = parsedmarc._decode_mime_payload(part, part.get_payload())
+                fallback = part.get_payload()
+                assert isinstance(fallback, str)
+                result = parsedmarc._decode_mime_payload(part, fallback)
                 self.assertEqual(result, "Subject: café\n")
                 self.assertEqual(part.as_string(), original)
 
@@ -6800,7 +6800,7 @@ class TestIngestionReliabilityFollowup(unittest.TestCase):
         from pathlib import Path
 
         report = parsedmarc.parse_aggregate_report_xml(self._xml(), offline=True)
-        results = {
+        results: ParsingResults = {
             "aggregate_reports": [report],
             "failure_reports": [],
             "smtp_tls_reports": [],
