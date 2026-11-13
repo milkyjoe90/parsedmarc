@@ -13,6 +13,7 @@ permissions:
 jobs:
   docs:
     name: Build and deploy docs
+    if: github.repository == 'domainaware/parsedmarc'
     runs-on: ubuntu-latest
     concurrency:
       group: github-pages-deploy

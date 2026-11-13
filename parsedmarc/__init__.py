@@ -1978,12 +1978,11 @@ def parse_aggregate_report_xml(
         new_report_metadata["end_date"] = date_range["end"]
         new_report_metadata["timespan_requires_normalization"] = normalize_timespan
         new_report_metadata["original_timespan_seconds"] = span_seconds
-        begin_dt = human_timestamp_to_datetime(
-            new_report_metadata["begin_date"], to_utc=True
-        )
-        end_dt = human_timestamp_to_datetime(
-            new_report_metadata["end_date"], to_utc=True
-        )
+        # Use the source epochs for UTC intervals (RFC 9990 section 3.1.1.4).
+        # A local naive string loses which occurrence of a DST fold it names.
+        # Report metadata above keeps its existing local-time display format.
+        begin_dt = datetime.fromtimestamp(begin_ts, timezone.utc)
+        end_dt = datetime.fromtimestamp(end_ts, timezone.utc)
 
         # <error> is langAttrString in RFC 9990 (xs:string in RFC 7489) and
         # was cardinality-narrowed from "unbounded" to "1" in RFC 9990, but

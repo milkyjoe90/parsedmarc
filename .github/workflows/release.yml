@@ -18,6 +18,7 @@ concurrency:
 jobs:
   ci:
     name: CI
+    if: github.repository == 'domainaware/parsedmarc'
     uses: ./.github/workflows/python-tests.yml
     secrets: inherit
 
@@ -29,6 +30,7 @@ jobs:
   # This job is what stops a release shipping with one of those open.
   code-scanning:
     name: No open code scanning alerts
+    if: github.repository == 'domainaware/parsedmarc'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -127,6 +129,7 @@ jobs:
 
   build:
     name: Build distributions
+    if: github.repository == 'domainaware/parsedmarc'
     needs: [ci, code-scanning]
     runs-on: ubuntu-latest
     steps:
@@ -158,6 +161,7 @@ jobs:
 
   publish-pypi:
     name: Publish to PyPI
+    if: github.repository == 'domainaware/parsedmarc'
     needs: build
     runs-on: ubuntu-latest
     environment:
@@ -177,6 +181,7 @@ jobs:
 
   github-release:
     name: Create GitHub release
+    if: github.repository == 'domainaware/parsedmarc'
     needs: publish-pypi
     runs-on: ubuntu-latest
     permissions:
@@ -212,6 +217,7 @@ jobs:
 
   docker:
     name: Build and push Docker image
+    if: github.repository == 'domainaware/parsedmarc'
     needs: publish-pypi
     # A GitHub Release created with this workflow's own GITHUB_TOKEN does not
     # emit a `release: published` event to other workflows (GitHub's
@@ -227,6 +233,7 @@ jobs:
 
   docs:
     name: Publish documentation
+    if: github.repository == 'domainaware/parsedmarc'
     # Gated on the publish so docs for a version that never shipped (tag
     # mismatch, failed upload) don't deploy.
     needs: publish-pypi
