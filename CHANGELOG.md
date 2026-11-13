@@ -1,5 +1,25 @@
 # Changelog
 
+## 11.3.0+cybaa.1
+
+### Bug fixes
+
+- Build aggregate record intervals directly from UTC report epochs. This preserves
+  daylight-saving fold identity and correct daily count allocation on non-UTC hosts,
+  including valid reports that previously produced inverted intervals or failed
+  normalization. Report-level metadata retains its existing local-time format.
+
+### Cybaa distribution
+
+- Publish the wheel, source distribution and SHA256SUMS on the Cybaa GitHub fork
+  only, after the full Python 3.11–3.15 CI and installed-artifact smoke checks.
+  Upstream PyPI, container publication and documentation deployment are disabled
+  in this fork. This release does not change input admission or output schemas.
+- Security review limitation: the fork has no CodeQL analysis and Dependabot
+  alerts are disabled. These checks have not passed. The secret-scanning API
+  returned no open alerts; published upstream advisories reviewed on 2026-11-13
+  identify fixes through the inherited 11.3.0 baseline.
+
 ## 11.3.0
 
 ### Security
