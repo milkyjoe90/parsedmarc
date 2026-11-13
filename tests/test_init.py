@@ -7764,6 +7764,176 @@ def _minimal_aggregate_xml(
     </feedback>"""
 
 
+@unittest.skipUnless(hasattr(time, "tzset"), "requires POSIX time.tzset()")
+class TestAggregateReportEpochIntervals(unittest.TestCase):
+    """RFC 9990 section 3.1.1.4 defines date_range as UTC epochs.
+
+    https://www.rfc-editor.org/rfc/rfc9990.html#section-3.1.1.4
+    Python's local naive conversion loses the DST fold when serialized:
+    https://docs.python.org/3/library/datetime.html#datetime.datetime.fromtimestamp
+    Record intervals and CSV must retain those epochs, while report metadata
+    keeps its existing local-time display contract.
+    """
+
+    def _parse_in_timezone(self, zone, begin, end, count=7, threshold=None):
+        begin_epoch = int(datetime.fromisoformat(begin).timestamp())
+        end_epoch = int(datetime.fromisoformat(end).timestamp())
+        xml = (
+            _minimal_aggregate_xml()
+            .replace("1704067200", str(begin_epoch))
+            .replace("1704153599", str(end_epoch))
+            .replace("<count>1</count>", f"<count>{count}</count>")
+        )
+        try:
+            with patch.dict(os.environ, {"TZ": zone}):
+                time.tzset()
+                if threshold is None:
+                    return parsedmarc.parse_aggregate_report_xml(xml, offline=True)
+                return parsedmarc.parse_aggregate_report_xml(
+                    xml,
+                    offline=True,
+                    normalize_timespan_threshold_hours=threshold,
+                )
+        finally:
+            time.tzset()
+
+    def _assert_intervals(self, report, expected):
+        self.assertEqual(
+            [
+                (record["interval_begin"], record["interval_end"], record["count"])
+                for record in report["records"]
+            ],
+            expected,
+        )
+        csv_rows = list(
+            csv.DictReader(StringIO(parsedmarc.parsed_aggregate_reports_to_csv(report)))
+        )
+        self.assertEqual(
+            [
+                (row["begin_date"], row["end_date"], int(row["count"]))
+                for row in csv_rows
+            ],
+            expected,
+        )
+
+    def testFoldCrossingKeepsEpochIntervals(self):
+        """A positive interval must not reverse when local clocks go back."""
+        cases = (
+            ("London", "Europe/London", "2026-10-25 00:45:00", "2026-10-25 01:15:00"),
+            (
+                "NewYork",
+                "America/New_York",
+                "2026-11-01 05:45:00",
+                "2026-11-01 06:15:00",
+            ),
+        )
+        for case, zone, begin, end in cases:
+            for mode, threshold in (("default", None), ("forced", 0.0)):
+                with self.subTest(case=case, mode=mode):
+                    report = self._parse_in_timezone(
+                        zone, begin + "+00:00", end + "+00:00", threshold=threshold
+                    )
+                    self._assert_intervals(report, [(begin, end, 7)])
+                    metadata = report["report_metadata"]
+                    self.assertEqual(metadata["original_timespan_seconds"], 1800)
+                    self.assertEqual(
+                        metadata["timespan_requires_normalization"], mode == "forced"
+                    )
+                    self.assertEqual(metadata["begin_date"], begin[:11] + "01:45:00")
+                    self.assertEqual(metadata["end_date"], end[:11] + "01:15:00")
+                    self.assertEqual(
+                        report["records"][0].get("normalized_timespan"),
+                        mode == "forced",
+                    )
+
+    def testSecondFoldKeepsEpochIntervals(self):
+        """The repeated hour must keep its second occurrence's UTC epoch."""
+        cases = (
+            ("London", "Europe/London", "2026-10-25 01:15:00", "2026-10-25 02:15:00"),
+            (
+                "NewYork",
+                "America/New_York",
+                "2026-11-01 06:15:00",
+                "2026-11-01 07:15:00",
+            ),
+        )
+        for case, zone, begin, end in cases:
+            for mode, threshold in (("default", None), ("forced", 0.0)):
+                with self.subTest(case=case, mode=mode):
+                    report = self._parse_in_timezone(
+                        zone, begin + "+00:00", end + "+00:00", threshold=threshold
+                    )
+                    self._assert_intervals(report, [(begin, end, 7)])
+                    self.assertEqual(
+                        report["report_metadata"]["original_timespan_seconds"], 3600
+                    )
+                    self.assertEqual(
+                        report["report_metadata"]["begin_date"], begin[:11] + "01:15:00"
+                    )
+                    self.assertEqual(
+                        report["report_metadata"]["end_date"], end[:11] + "02:15:00"
+                    )
+
+    def testDefaultNormalizationKeepsFoldCountsAndDuration(self):
+        """A 25-hour report must not gain an hour or redistribute its count."""
+        begin = "2026-11-01 06:15:00"
+        end = "2026-11-02 07:15:00"
+        expected = [
+            (begin, "2026-11-02 00:00:00", 71),
+            ("2026-11-02 00:00:00", end, 29),
+        ]
+        for zone in ("UTC", "Europe/London", "America/New_York"):
+            with self.subTest(zone=zone):
+                report = self._parse_in_timezone(
+                    zone, begin + "+00:00", end + "+00:00", count=100
+                )
+                self._assert_intervals(report, expected)
+                metadata = report["report_metadata"]
+                self.assertTrue(metadata["timespan_requires_normalization"])
+                self.assertEqual(metadata["original_timespan_seconds"], 90000)
+                self.assertEqual(
+                    sum(record["count"] for record in report["records"]), 100
+                )
+                self.assertTrue(
+                    all(
+                        record.get("normalized_timespan")
+                        for record in report["records"]
+                    )
+                )
+                self.assertEqual(
+                    sum(
+                        (
+                            datetime.fromisoformat(record["interval_end"])
+                            - datetime.fromisoformat(record["interval_begin"])
+                        ).total_seconds()
+                        for record in report["records"]
+                    ),
+                    metadata["original_timespan_seconds"],
+                )
+                if zone == "America/New_York":
+                    self.assertEqual(metadata["begin_date"], "2026-11-01 01:15:00")
+                    self.assertEqual(metadata["end_date"], "2026-11-02 02:15:00")
+                else:
+                    self.assertEqual(metadata["begin_date"], begin)
+                    self.assertEqual(metadata["end_date"], end)
+
+    def testSummerMetadataKeepsLocalDisplayWithUtcIntervals(self):
+        """Ordinary offsets retain local metadata and UTC record/CSV dates."""
+        begin = "2026-07-01 00:15:00"
+        end = "2026-07-01 01:15:00"
+        cases = (
+            ("UTC", begin, end),
+            ("Europe/London", "2026-07-01 01:15:00", "2026-07-01 02:15:00"),
+            ("America/New_York", "2026-06-30 20:15:00", "2026-06-30 21:15:00"),
+        )
+        for zone, local_begin, local_end in cases:
+            with self.subTest(zone=zone):
+                report = self._parse_in_timezone(zone, begin + "+00:00", end + "+00:00")
+                self._assert_intervals(report, [(begin, end, 7)])
+                self.assertEqual(report["report_metadata"]["begin_date"], local_begin)
+                self.assertEqual(report["report_metadata"]["end_date"], local_end)
+
+
 class TestAggregateReportEdgeCases(unittest.TestCase):
     """Parsing edge cases for aggregate report XML documents."""
 
